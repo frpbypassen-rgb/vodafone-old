@@ -29,6 +29,7 @@ const rechargeCompanyWizard = require('./scenes/rechargeCompanyScene');
 const settingsWizard = require('./scenes/settingsScene');
 const settleManagerWizard = require('./scenes/settleManagerScene'); 
 const editTxRateWizard = require('./scenes/editTxRateScene'); 
+const { recordBalanceAdjustment, parseSignedAmount } = require('../../services/balanceAdjustmentService');
 
 const startAdminBot = async () => {
     
@@ -654,27 +655,28 @@ const startAdminBot = async () => {
             const user = await User.findOne({ telegramId: args[1] });
             if (!user) return ctx.reply('❌ لم يتم العثور على العميل.');
             
-            const amount = parseFloat(args[2]);
-            user.balance += amount;
-            await user.save();
+            const amount = parseSignedAmount(args[2]);
+            if (amount <= 0) return ctx.reply('❌ المبلغ يجب أن يكون أكبر من الصفر.');
 
-            const now = new Date();
-            const depId = `DEP-${now.getTime().toString().slice(-6)}`; 
-            await Transaction.create({
-                userId: ctx.from.id.toString(),
-                amount: amount, 
-                costLYD: 0,
-                vodafoneNumber: '01000000000', 
-                status: 'deposit',
-                customId: depId,
-                clientBotId: null,
-                companyName: 'عميل فردي',
-                employeeName: 'الإدارة (إيداع)' 
+            const result = await recordBalanceAdjustment({
+                entityModel: 'User',
+                entityId: user._id,
+                amount,
+                transactionData: {
+                    userId: user.telegramId,
+                    clientBotId: null,
+                    vodafoneNumber: '01000000000',
+                    companyName: 'عميل فردي',
+                    employeeName: 'الإدارة (إيداع)'
+                },
+                description: 'إيداع رصيد عميل فردي من أمر addbalance'
             });
+            user.balance = result.balanceAfter;
 
             ctx.reply(`✅ تم الشحن بنجاح. الرصيد الحالي للعميل: ${user.balance}`);
         } catch (err) {
             console.error(err);
+            ctx.reply('❌ تعذر تنفيذ الشحن. تأكد من رقم العميل والمبلغ.');
         }
     });
 

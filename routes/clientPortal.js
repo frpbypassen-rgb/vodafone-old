@@ -1,11 +1,10 @@
-// routes/clientPortal.js
 const express = require('express');
 const ExcelJS = require('exceljs');
 const https = require('https'); 
 const router = express.Router();
 const { Telegram } = require('telegraf');
 const mongoose = require('mongoose');
-const bcrypt = require('bcryptjs');
+const bcrypt = require('bcryptjs'); // 🟢 تمت إضافة التشفير لحماية كلمات المرور
 
 const User = require('../models/User');
 const ClientEmployee = require('../models/ClientEmployee');
@@ -20,10 +19,6 @@ const StoreCategory = require('../models/StoreCategory');
 const StoreProduct = require('../models/StoreProduct');
 const SubAccount = require('../models/SubAccount');
 const Counter = require('../models/Counter'); 
-const Ledger = require('../models/Ledger'); // 🟢 استدعاء دفتر الأستاذ
-
-// 🟢 استدعاء المحرك المالي لتسوية نقاط البيع
-const { updateBalanceWithLedger } = require('../services/walletService'); 
 
 const getArgb = (hex) => 'FF' + (hex || '#FFFFFF').replace('#', '').toUpperCase();
 
@@ -36,10 +31,12 @@ const buildSegmentedInvoiceSheet = (sheet, name, phone, dateLabel, txs, deposits
     const borderStyle = { top: { style: 'thin' }, left: { style: 'thin' }, bottom: { style: 'thin' }, right: { style: 'thin' } };
     const thickBorder = { top: { style: 'medium' }, left: { style: 'medium' }, bottom: { style: 'medium' }, right: { style: 'medium' } };
 
+    // ضبط عرض الأعمدة
     sheet.getColumn(1).width = 6; sheet.getColumn(2).width = 18; sheet.getColumn(3).width = 25; 
     sheet.getColumn(4).width = 15; sheet.getColumn(5).width = 15; sheet.getColumn(6).width = 15; 
     sheet.getColumn(7).width = 18; sheet.getColumn(8).width = 25;
 
+    // --- ترويسة التقرير ---
     sheet.mergeCells('A1:H2');
     const titleCell = sheet.getCell('A1'); 
     titleCell.value = 'شــــركــــــــة Al-Ahram Pay لـلـتـقـنـيـة'; 
@@ -127,7 +124,7 @@ const requireClientAuth = (req, res, next) => {
 };
 
 // ===============================================
-// 👤 نظام تسجيل الدخول
+// 👤 نظام تسجيل الدخول الموحد للعملاء ونقاط البيع
 // ===============================================
 router.get('/login', (req, res) => {
     if (req.session.isClientLoggedIn) return res.redirect('/client/dashboard');
@@ -145,6 +142,7 @@ router.post('/login', async (req, res) => {
         const usernameRegex = new RegExp(`^${safeUsername}$`, 'i');
         const todayStr = new Date().toLocaleDateString('en-GB', { timeZone: 'Africa/Tripoli' });
 
+        // 1. حسابات نقاط البيع (SubAccounts)
         const subAcc = await SubAccount.findOne({ webUsername: usernameRegex }).lean();
         if (subAcc) {
             let isMatch = false;
@@ -161,6 +159,7 @@ router.post('/login', async (req, res) => {
             }
         }
 
+        // 2. العملاء الأفراد
         const clientUser = await User.findOne({ $or: [{ webUsername: usernameRegex }, { phone: username }] }).lean();
         if (clientUser) {
             let isMatch = false;
@@ -188,6 +187,7 @@ router.post('/login', async (req, res) => {
             }
         }
 
+        // 3. موظفي الشركات
         const clientCompany = await ClientEmployee.findOne({ $or: [{ webUsername: usernameRegex }, { phone: username }] }).lean();
         if (clientCompany) {
             let isMatch = false;
@@ -249,13 +249,14 @@ router.post('/verify', async (req, res) => {
 router.get('/logout', (req, res) => { req.session.destroy(); res.redirect('/client/login'); });
 
 // ===============================================
-// 🚀 حماية مسارات إثباتات التنفيذ
+// 🚀 حماية مسارات إثباتات التنفيذ (Images Access)
 // ===============================================
 router.get(['/proxy/image/:id', '/proxy/image/:id/:index'], requireClientAuth, async (req, res) => {
     try {
         const tx = await Transaction.findById(req.params.id);
         if (!tx) return res.status(404).send('لا توجد صورة إثبات');
 
+        // 🛡️ حماية الصلاحيات: التحقق من أحقية العميل برؤية الصورة
         const isSubAccount = req.session.accountType === 'sub_client';
         const accountId = req.session.clientId;
         let hasAccess = false;
@@ -317,7 +318,7 @@ router.get(['/proxy/image/:id', '/proxy/image/:id/:index'], requireClientAuth, a
 });
 
 // ===============================================
-// 🚀 إدارة نقاط البيع والوكلاء الفرعيين (مدعوم بالـ Ledger)
+// 🚀 إدارة نقاط البيع والوكلاء الفرعيين
 // ===============================================
 router.get('/sub-accounts', requireClientAuth, async (req, res) => {
     if (req.session.accountType === 'sub_client') return res.redirect('/client/dashboard'); 
@@ -355,24 +356,14 @@ router.post('/sub-accounts/settle/:id', requireClientAuth, async (req, res) => {
         const sub = await SubAccount.findById(req.params.id);
         if(sub) {
             if (type === 'withdraw' && sub.balance < val) return res.redirect('/client/sub-accounts?error=funds');
-            
-            const txId = `SET-${Date.now().toString().slice(-6)}`;
-            
-            // 🟢 استخدام المحرك المالي الذري لتوثيق التسوية
-            await updateBalanceWithLedger(
-                'SubAccount', 
-                sub._id, 
-                type === 'add' ? val : -val, 
-                type === 'add' ? 'DEPOSIT' : 'DEDUCTION', 
-                txId, 
-                type === 'add' ? `تمويل نقطة بيع (${sub.name})` : `سحب رصيد من نقطة بيع (${sub.name})`
-            );
+            if (type === 'withdraw') val = -val;
+            sub.balance += val; await sub.save();
 
             let parentUserId = null, parentClientBotId = null, empName = 'الوكيل';
             if (req.session.accountType === 'company') { const emp = await ClientEmployee.findById(req.session.clientId); parentClientBotId = emp.clientBotId; empName = emp.name; } 
             else { const user = await User.findById(req.session.clientId); parentUserId = user.telegramId; empName = user.name; }
 
-            await Transaction.create({ customId: txId, subAccountId: sub._id, userId: parentUserId, clientBotId: parentClientBotId, amount: Math.abs(val), costLYD: 0, status: type === 'add' ? 'deposit' : 'deduction', notes: type === 'add' ? `تمويل نقطة بيع (${sub.name})` : `سحب رصيد من نقطة بيع (${sub.name})`, companyName: 'تسوية وكيل', employeeName: empName });
+            await Transaction.create({ customId: `SET-${Date.now().toString().slice(-6)}`, subAccountId: sub._id, userId: parentUserId, clientBotId: parentClientBotId, amount: Math.abs(val), costLYD: 0, status: type === 'add' ? 'deposit' : 'deduction', notes: type === 'add' ? `تمويل نقطة بيع (${sub.name})` : `سحب رصيد من نقطة بيع (${sub.name})`, companyName: 'تسوية وكيل', employeeName: empName });
         }
         res.redirect('/client/sub-accounts');
     } catch(e) { res.redirect('/client/sub-accounts?error=db'); }
@@ -491,135 +482,101 @@ router.get('/dashboard', requireClientAuth, async (req, res) => {
 });
 
 // ===============================================
-// 💸 نظام التحويل البنكي المحصن (Idempotency + Transactions + Ledger)
+// 💸 نظام التحويل محصن بالعمليات الذرية
 // ===============================================
 router.post('/transfer', requireClientAuth, async (req, res) => {
     const isAjax = req.xhr || (req.headers.accept && req.headers.accept.includes('application/json'));
+    const isSubAccount = req.session.accountType === 'sub_client';
+    const Model = isSubAccount ? SubAccount : (req.session.accountType === 'company' ? ClientEmployee : User);
+    const account = await Model.findById(req.session.clientId);
     
-    // 🟢 بدء المعاملة الذرية (Transaction) لحماية جميع الخطوات
-    const session = await mongoose.startSession();
-    session.startTransaction();
+    if (account.role === 'accountant') return isAjax ? res.status(403).json({ error: '❌ ليس لديك صلاحية.' }) : res.redirect('/client/dashboard?error=unauthorized');
 
-    try {
-        const isSubAccount = req.session.accountType === 'sub_client';
-        const Model = isSubAccount ? SubAccount : (req.session.accountType === 'company' ? ClientEmployee : User);
-        const account = await Model.findById(req.session.clientId).session(session);
-        
-        if (account.role === 'accountant') {
-            await session.abortTransaction();
-            session.endSession();
-            return isAjax ? res.status(403).json({ error: '❌ ليس لديك صلاحية.' }) : res.redirect('/client/dashboard?error=unauthorized');
-        }
+    const amount = parseFloat(req.body.amount); const phone = req.body.phone; const notes = req.body.notes ? req.body.notes.trim() : ''; const transferType = req.body.type || 'كاش'; const imageBase64 = req.body.imageBase64; 
 
-        const amount = parseFloat(req.body.amount); 
-        const phone = req.body.phone; 
-        const notes = req.body.notes ? req.body.notes.trim() : ''; 
-        const transferType = req.body.type || 'كاش'; 
-        const imageBase64 = req.body.imageBase64; 
+    if (isNaN(amount) || amount <= 0 || !phone) return isAjax ? res.status(400).json({ error: '❌ بيانات التحويل غير صحيحة.' }) : null;
 
-        if (isNaN(amount) || amount <= 0 || !phone) throw new Error('INVALID_DATA');
+    const settings = await Settings.findOne({});
+    if (settings && settings.isManualClosed) return isAjax ? res.status(403).json({ error: '⛔ النظام مغلق.' }) : null;
 
-        const settings = await Settings.findOne({}).session(session);
-        if (settings && settings.isManualClosed) throw new Error('SYSTEM_CLOSED');
+    let masterRate, actualSubRate, subCostLYD, masterCostLYD, commission = 0;
+    let balanceModel, limit, clientBotId = null, companyName = 'عميل فردي (ويب)';
+    let masterObj, telegramId = null;
 
-        let masterRate, actualSubRate, subCostLYD, masterCostLYD, commission = 0;
-        let balanceModel, limit, clientBotId = null, companyName = 'عميل فردي (ويب)';
-        let masterObj, telegramId = null;
-        let finalCustomId = '';
+    if (isSubAccount) {
+        masterObj = account.masterType === 'user' ? await User.findById(account.masterId) : await ClientBot.findById(account.masterId);
+        let clientTier = masterObj.tier || 1;
+        masterRate = clientTier === 3 ? settings.rateLevel3 : (clientTier === 2 ? settings.rateLevel2 : settings.rateLevel1);
+        if (transferType === 'بريد حساب') masterRate -= 0.05; else if (transferType === 'بريد بطاقة') masterRate -= 0.15; 
+        actualSubRate = masterRate - account.customMargin; if (actualSubRate <= 0) actualSubRate = masterRate;
+        subCostLYD = parseFloat((amount / actualSubRate).toFixed(3)); masterCostLYD = parseFloat((amount / masterRate).toFixed(3)); commission = parseFloat((subCostLYD - masterCostLYD).toFixed(3));
 
-        // 🟢 إعداد الـ ID الخاص بالفاتورة مبكراً لتوثيقه في الدفتر
-        const counter = await Counter.findOneAndUpdate(
-            { name: 'transaction' },
-            { $inc: { value: 1 } },
-            { upsert: true, new: true, session }
+        if (account.masterType === 'company') { clientBotId = masterObj._id; companyName = masterObj.name; telegramId = null; }
+        else { companyName = masterObj.name; telegramId = masterObj.telegramId; }
+
+        const minSubBalance = subCostLYD - (account.creditLimit || 0);
+        const minMasterBalance = masterCostLYD - (masterObj.creditLimit || 0);
+
+        const updatedSub = await SubAccount.findOneAndUpdate(
+            { _id: account._id, balance: { $gte: minSubBalance } },
+            { $inc: { balance: -subCostLYD } },
+            { new: true }
         );
-        const yy = new Date().getFullYear().toString().slice(-2);
-        const mm = (new Date().getMonth() + 1).toString().padStart(2, '0');
-        finalCustomId = `ATT-${yy}${mm}-${counter.value.toString().padStart(4, '0')}`;
+        if (!updatedSub) return isAjax ? res.status(400).json({ error: '❌ رصيد نقطة البيع غير كافٍ أو تغير أثناء العملية.' }) : null;
 
-        if (isSubAccount) {
-            masterObj = account.masterType === 'user' ? await User.findById(account.masterId).session(session) : await ClientBot.findById(account.masterId).session(session);
-            let clientTier = masterObj.tier || 1;
-            masterRate = clientTier === 3 ? settings.rateLevel3 : (clientTier === 2 ? settings.rateLevel2 : settings.rateLevel1);
-            if (transferType === 'بريد حساب') masterRate -= 0.05; else if (transferType === 'بريد بطاقة') masterRate -= 0.15; 
-            actualSubRate = masterRate - account.customMargin; if (actualSubRate <= 0) actualSubRate = masterRate;
-            subCostLYD = parseFloat((amount / actualSubRate).toFixed(3)); masterCostLYD = parseFloat((amount / masterRate).toFixed(3)); commission = parseFloat((subCostLYD - masterCostLYD).toFixed(3));
+        const MasterModel = account.masterType === 'user' ? User : ClientBot;
+        const updatedMaster = await MasterModel.findOneAndUpdate(
+            { _id: masterObj._id, balance: { $gte: minMasterBalance } },
+            { $inc: { balance: -masterCostLYD } },
+            { new: true }
+        );
 
-            if (account.masterType === 'company') { clientBotId = masterObj._id; companyName = masterObj.name; telegramId = null; }
-            else { companyName = masterObj.name; telegramId = masterObj.telegramId; }
-
-            const minSubBalance = subCostLYD - (account.creditLimit || 0);
-            const minMasterBalance = masterCostLYD - (masterObj.creditLimit || 0);
-
-            // 🟢 الخصم الذري لنقطة البيع + القيد المالي
-            const updatedSub = await SubAccount.findOneAndUpdate(
-                { _id: account._id, balance: { $gte: minSubBalance } },
-                { $inc: { balance: -subCostLYD } },
-                { new: true, session }
-            );
-            if (!updatedSub) throw new Error('SUB_INSUFFICIENT_BALANCE');
-            
-            await new Ledger({
-                entityId: account._id, entityModel: 'SubAccount', transactionId: finalCustomId,
-                type: 'TRANSFER', amount: -subCostLYD, balanceBefore: updatedSub.balance + subCostLYD,
-                balanceAfter: updatedSub.balance, description: `تحويل ${amount} EGP إلى ${phone}`
-            }).save({ session });
-
-            // 🟢 الخصم الذري للرئيسي + القيد المالي
-            const MasterModel = account.masterType === 'user' ? User : ClientBot;
-            const updatedMaster = await MasterModel.findOneAndUpdate(
-                { _id: masterObj._id, balance: { $gte: minMasterBalance } },
-                { $inc: { balance: -masterCostLYD } },
-                { new: true, session }
-            );
-
-            if (!updatedMaster) throw new Error('MASTER_INSUFFICIENT_BALANCE');
-            
-            await new Ledger({
-                entityId: masterObj._id, entityModel: MasterModel.modelName, transactionId: finalCustomId,
-                type: 'TRANSFER', amount: -masterCostLYD, balanceBefore: updatedMaster.balance + masterCostLYD,
-                balanceAfter: updatedMaster.balance, description: `تحويل من نقطة بيع (${account.name}): ${amount} EGP إلى ${phone}`
-            }).save({ session });
-
-            balanceModel = updatedSub;
-            masterObj = updatedMaster;
-
-        } else {
-            if (req.session.accountType === 'company') {
-                const company = await ClientBot.findById(account.clientBotId).session(session);
-                masterRate = company.tier === 3 ? settings.rateLevel3 : (company.tier === 2 ? settings.rateLevel2 : settings.rateLevel1);
-                if (transferType === 'بريد حساب') masterRate -= 0.05; else if (transferType === 'بريد بطاقة') masterRate -= 0.15; 
-                masterCostLYD = parseFloat((amount / masterRate).toFixed(3));
-                balanceModel = company; clientBotId = company._id; companyName = company.name; telegramId = account.telegramId;
-            } else {
-                masterRate = account.tier === 3 ? settings.rateLevel3 : (account.tier === 2 ? settings.rateLevel2 : settings.rateLevel1);
-                if (transferType === 'بريد حساب') masterRate -= 0.05; else if (transferType === 'بريد بطاقة') masterRate -= 0.15; 
-                masterCostLYD = parseFloat((amount / masterRate).toFixed(3));
-                balanceModel = account; telegramId = account.telegramId;
-            }
-
-            const minBalance = masterCostLYD - (balanceModel.creditLimit || 0);
-            const BModel = req.session.accountType === 'company' ? ClientBot : User;
-            
-            // 🟢 الخصم الذري للرئيسي + القيد المالي
-            const updatedClient = await BModel.findOneAndUpdate(
-                { _id: balanceModel._id, balance: { $gte: minBalance } },
-                { $inc: { balance: -masterCostLYD } },
-                { new: true, session }
-            );
-
-            if (!updatedClient) throw new Error('INSUFFICIENT_BALANCE');
-            balanceModel = updatedClient;
-
-            await new Ledger({
-                entityId: balanceModel._id, entityModel: BModel.modelName, transactionId: finalCustomId,
-                type: 'TRANSFER', amount: -masterCostLYD, balanceBefore: balanceModel.balance + masterCostLYD,
-                balanceAfter: balanceModel.balance, description: `تحويل ${amount} EGP إلى ${phone}`
-            }).save({ session });
+        if (!updatedMaster) {
+            await SubAccount.findByIdAndUpdate(account._id, { $inc: { balance: subCostLYD } }); 
+            return isAjax ? res.status(400).json({ error: '❌ رصيد الوكيل الرئيسي غير كافٍ لتغطية التكلفة الأساسية.' }) : null;
         }
+        balanceModel = updatedSub;
+        masterObj = updatedMaster;
 
-        // 🟢 تسجيل المعاملة النهائية
-        const newTx = new Transaction({
+    } else if (req.session.accountType === 'company') {
+        const company = await ClientBot.findById(account.clientBotId);
+        masterRate = company.tier === 3 ? settings.rateLevel3 : (company.tier === 2 ? settings.rateLevel2 : settings.rateLevel1);
+        if (transferType === 'بريد حساب') masterRate -= 0.05; else if (transferType === 'بريد بطاقة') masterRate -= 0.15; 
+        masterCostLYD = parseFloat((amount / masterRate).toFixed(3));
+        balanceModel = company; clientBotId = company._id; companyName = company.name; telegramId = account.telegramId;
+    } else {
+        masterRate = account.tier === 3 ? settings.rateLevel3 : (account.tier === 2 ? settings.rateLevel2 : settings.rateLevel1);
+        if (transferType === 'بريد حساب') masterRate -= 0.05; else if (transferType === 'بريد بطاقة') masterRate -= 0.15; 
+        masterCostLYD = parseFloat((amount / masterRate).toFixed(3));
+        balanceModel = account; telegramId = account.telegramId;
+    }
+
+    if (!isSubAccount) {
+        const minBalance = masterCostLYD - (balanceModel.creditLimit || 0);
+        const BModel = req.session.accountType === 'company' ? ClientBot : User;
+        
+        const updatedClient = await BModel.findOneAndUpdate(
+            { _id: balanceModel._id, balance: { $gte: minBalance } },
+            { $inc: { balance: -masterCostLYD } },
+            { new: true }
+        );
+
+        if (!updatedClient) return isAjax ? res.status(400).json({ error: '❌ رصيدك غير كافٍ أو تغير أثناء العملية.' }) : null;
+        balanceModel = updatedClient;
+    }
+
+    const counter = await Counter.findOneAndUpdate(
+        { name: 'transaction' },
+        { $inc: { value: 1 } },
+        { upsert: true, new: true }
+    );
+    const yy = new Date().getFullYear().toString().slice(-2);
+    const mm = (new Date().getMonth() + 1).toString().padStart(2, '0');
+    let finalCustomId = `ATT-${yy}${mm}-${counter.value.toString().padStart(4, '0')}`;
+
+    let newTx;
+    try {
+        newTx = await Transaction.create({
             customId: finalCustomId, userId: telegramId, clientBotId: clientBotId, subAccountId: isSubAccount ? account._id : null,
             subAccountName: isSubAccount ? account.name : '', companyName: isSubAccount ? masterObj.name : companyName, 
             employeeName: isSubAccount ? account.name : account.name, vodafoneNumber: phone, transferType: transferType,
@@ -627,56 +584,50 @@ router.post('/transfer', requireClientAuth, async (req, res) => {
             subAccountCostLYD: isSubAccount ? subCostLYD : 0, commission: commission, exchangeRate: masterRate, subClientRate: isSubAccount ? actualSubRate : 0,
             notes: notes, status: 'pending', isSubAccountTx: isSubAccount, masterProfit: isSubAccount ? commission : 0
         });
-        await newTx.save({ session });
-
-        // ✅ تأكيد العملية بنجاح (Commit)
-        await session.commitTransaction();
-        session.endSession();
-
-        if (isAjax) res.json({ success: true, message: '✅ تم الإرسال بنجاح!', newBalance: balanceModel.balance.toFixed(2) });
-
-        // 🔔 إرسال الإشعارات (تعمل بشكل غير متزامن خارج الترانزاكشن)
-        setImmediate(async () => {
-            try {
-                const adminAPI = new Telegram(process.env.ADMIN_BOT_TOKEN);
-                const masterNameText = isSubAccount ? masterObj.name : companyName;
-                const requesterText = isSubAccount ? `${account.name} (نقطة بيع)` : 'حساب الوكيل المباشر';
-                const profitNote = commission > 0 ? `\n🎁 <b>ربح الوكيل من العملية:</b> ${commission.toFixed(3)} LYD` : '';
-                
-                const adminMsg = `🔔 <b>طلب جديد من الويب!</b>\n\n🏢 <b>الوكيل الرئيسي:</b> ${masterNameText}\n🏪 <b>الجهة الطالبة:</b> ${requesterText}\n📞 <b>المحفظة:</b> <code>${phone}</code>\n💵 <b>المبلغ:</b> ${amount} EGP\n💰 <b>التكلفة:</b> ${masterCostLYD.toFixed(3)} LYD${profitNote}\n📝 <b>التفاصيل:</b> <b>${notes || 'لا يوجد'}</b>\n🔢 <b>رقم:</b> <code>${finalCustomId}</code>`;
-                
-                const keyboard = { inline_keyboard: [[{ text: '🤖 توجيه لبوت التنفيذ', callback_data: `forward_${newTx._id}` }], [{ text: '❌ رفض وإلغاء', callback_data: `cancelReq_${newTx._id}` }]] };
-                const admins = await Admin.find({});
-                let savedAdminMsgs = []; 
-                for (const admin of admins) {
-                    if(admin.telegramId && !admin.webUsername) {
-                        try {
-                            let sent;
-                            if (imageBase64) {
-                                const imageBuffer = Buffer.from(imageBase64.replace(/^data:image\/\w+;base64,/, ""), 'base64');
-                                sent = await adminAPI.sendPhoto(admin.telegramId, { source: imageBuffer }, { caption: adminMsg, parse_mode: 'HTML', reply_markup: keyboard });
-                            } else {
-                                sent = await adminAPI.sendMessage(admin.telegramId, adminMsg, { parse_mode: 'HTML', reply_markup: keyboard });
-                            }
-                            if(sent) savedAdminMsgs.push({ telegramId: admin.telegramId, messageId: sent.message_id });
-                        } catch(e) {}
-                    }
-                }
-                if (savedAdminMsgs.length > 0) await Transaction.findByIdAndUpdate(newTx._id, { $push: { adminMessages: { $each: savedAdminMsgs } } });
-            } catch(e) {}
-        });
-
-    } catch (error) {
-        // 🔴 في حال أي خطأ يتم التراجع عن خصم الأرصدة وإلغاء الفواتير والدفتر
-        await session.abortTransaction();
-        session.endSession();
-
-        if (error.message === 'SYSTEM_CLOSED') return isAjax ? res.status(403).json({ error: '⛔ النظام مغلق.' }) : null;
-        if (error.message === 'INVALID_DATA') return isAjax ? res.status(400).json({ error: '❌ بيانات التحويل غير صحيحة.' }) : null;
-        if (error.message.includes('INSUFFICIENT_BALANCE')) return isAjax ? res.status(400).json({ error: '❌ الرصيد غير كافٍ أو تغير أثناء العملية.' }) : null;
-
+    } catch (dbError) {
+        if (isSubAccount) { 
+            await SubAccount.findByIdAndUpdate(account._id, { $inc: { balance: subCostLYD } });
+            const MasterModel = account.masterType === 'user' ? User : ClientBot;
+            await MasterModel.findByIdAndUpdate(masterObj._id, { $inc: { balance: masterCostLYD } });
+        } else { 
+            const BModel = req.session.accountType === 'company' ? ClientBot : User;
+            await BModel.findByIdAndUpdate(balanceModel._id, { $inc: { balance: masterCostLYD } });
+        }
         return isAjax ? res.status(500).json({ error: '❌ خطأ داخلي.' }) : null;
     }
+
+    if (isAjax) res.json({ success: true, message: '✅ تم الإرسال بنجاح!', newBalance: balanceModel.balance.toFixed(2) });
+
+    setImmediate(async () => {
+        try {
+            const adminAPI = new Telegram(process.env.ADMIN_BOT_TOKEN);
+            
+            const masterNameText = isSubAccount ? masterObj.name : companyName;
+            const requesterText = isSubAccount ? `${account.name} (نقطة بيع)` : 'حساب الوكيل المباشر';
+            const profitNote = commission > 0 ? `\n🎁 <b>ربح الوكيل من العملية:</b> ${commission.toFixed(3)} LYD` : '';
+            
+            const adminMsg = `🔔 <b>طلب جديد من الويب!</b>\n\n🏢 <b>الوكيل الرئيسي:</b> ${masterNameText}\n🏪 <b>الجهة الطالبة:</b> ${requesterText}\n📞 <b>المحفظة:</b> <code>${phone}</code>\n💵 <b>المبلغ:</b> ${amount} EGP\n💰 <b>التكلفة المستقطعة من الوكيل:</b> ${masterCostLYD.toFixed(3)} LYD${profitNote}\n📝 <b>التفاصيل:</b> <b>${notes || 'لا يوجد'}</b>\n🔢 <b>رقم:</b> <code>${finalCustomId}</code>`;
+            
+            const keyboard = { inline_keyboard: [[{ text: '🤖 توجيه لبوت التنفيذ', callback_data: `forward_${newTx._id}` }], [{ text: '❌ رفض وإلغاء', callback_data: `cancelReq_${newTx._id}` }]] };
+            const admins = await Admin.find({});
+            let savedAdminMsgs = []; 
+            for (const admin of admins) {
+                if(admin.telegramId && !admin.webUsername) {
+                    try {
+                        let sent;
+                        if (imageBase64) {
+                            const imageBuffer = Buffer.from(imageBase64.replace(/^data:image\/\w+;base64,/, ""), 'base64');
+                            sent = await adminAPI.sendPhoto(admin.telegramId, { source: imageBuffer }, { caption: adminMsg, parse_mode: 'HTML', reply_markup: keyboard });
+                        } else {
+                            sent = await adminAPI.sendMessage(admin.telegramId, adminMsg, { parse_mode: 'HTML', reply_markup: keyboard });
+                        }
+                        if(sent) savedAdminMsgs.push({ telegramId: admin.telegramId, messageId: sent.message_id });
+                    } catch(e) {}
+                }
+            }
+            if (savedAdminMsgs.length > 0) await Transaction.findByIdAndUpdate(newTx._id, { $push: { adminMessages: { $each: savedAdminMsgs } } });
+        } catch(e) {}
+    });
 });
 
 router.post('/buy-card', requireClientAuth, async (req, res) => {

@@ -28,6 +28,7 @@ const { errorHandler, notFoundHandler } = require('./middlewares/errorHandler');
 
 // 🟢 استدعاء طابور المهام الجديد (Queue System)
 const apiTransferQueue = require('./services/queueService');
+const { recordBalanceAdjustment, parseSignedAmount } = require('./services/balanceAdjustmentService');
 
 const app = express();
 
@@ -104,7 +105,7 @@ app.set('views', path.join(__dirname, 'views'));
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
 app.use(express.static(path.join(__dirname, 'public')));
-app.use('/uploads', require('express').static(require('path').join(__dirname, 'uploads')));
+
 // 🟢 إدارة الجلسات
 let sessionStore;
 try {
@@ -933,11 +934,20 @@ app.get('/company/:id', requireAuth, async (req, res) => {
 
 app.post('/user/:id/add-balance', requireAuth, async (req, res) => {
     try {
-        const user = await User.findById(req.params.id); const amount = parseFloat(req.body.amount); const notes = req.body.notes ? req.body.notes.trim() : ''; 
-        if (!isNaN(amount) && amount !== 0) {
-            user.balance += amount; await user.save();
-            const tx = await Transaction.create({ userId: user.telegramId, amount: Math.abs(amount), costLYD: 0, vodafoneNumber: '01000000000', status: amount > 0 ? 'deposit' : 'deduction', customId: `DEP-${Date.now().toString().slice(-6)}`, companyName: 'عميل فردي', employeeName: amount > 0 ? 'الإدارة (إيداع)' : 'الإدارة (خصم)', notes: notes });
-            const actionType = amount > 0 ? 'إيداع/شحن رصيد' : 'خصم من الرصيد'; const msg = `💰 <b>إشعار مالي من الإدارة (${actionType})</b>\n\n💵 المبلغ: <b>${Math.abs(amount).toFixed(2)} دينار/EGP</b>\n📝 الملاحظة: ${notes || 'لا يوجد'}\n🧾 رقم العملية: <code>${tx.customId}</code>`;
+        const user = await User.findById(req.params.id); if (!user) return res.redirect('/clients');
+        let amount; try { amount = parseSignedAmount(req.body.amount); } catch (_) { return res.redirect(`/user/${user._id}`); }
+        const notes = req.body.notes ? req.body.notes.trim() : '';
+        if (user && amount !== 0) {
+            const result = await recordBalanceAdjustment({
+                entityModel: 'User',
+                entityId: user._id,
+                amount,
+                transactionData: { userId: user.telegramId, clientBotId: null, vodafoneNumber: '01000000000', companyName: 'عميل فردي', employeeName: amount > 0 ? 'الإدارة (إيداع)' : 'الإدارة (خصم)', notes },
+                description: amount > 0 ? 'إيداع رصيد عميل فردي من الإدارة' : 'خصم رصيد عميل فردي من الإدارة'
+            });
+            user.balance = result.balanceAfter;
+            const tx = result.transaction;
+            const actionType = amount > 0 ? 'إيداع/شحن رصيد' : 'خصم من الرصيد'; const msg = `💰 <b>إشعار مالي من الإدارة (${actionType})</b>\n\n💵 المبلغ: <b>${Math.abs(amount).toFixed(2)} دينار/EGP</b>\n💳 الرصيد الحالي: <b>${result.balanceAfter.toFixed(2)}</b>\n📝 الملاحظة: ${notes || 'لا يوجد'}\n🧾 رقم العملية: <code>${tx.customId}</code>`;
             const mainAPI = new Telegram(process.env.CLIENT_BOT_TOKEN); mainAPI.sendMessage(user.telegramId, msg, { parse_mode: 'HTML' }).catch(()=>{});
         }
         res.redirect(`/user/${user._id}`);
@@ -958,11 +968,20 @@ app.post('/user/:id/update-limit', requireAuth, async (req, res) => {
 
 app.post('/company/:id/add-balance', requireAuth, async (req, res) => {
     try {
-        const comp = await ClientBot.findById(req.params.id); const amount = parseFloat(req.body.amount); const notes = req.body.notes ? req.body.notes.trim() : '';
-        if (!isNaN(amount) && amount !== 0) {
-            comp.balance += amount; await comp.save();
-            const tx = await Transaction.create({ userId: 'admin', clientBotId: comp._id, amount: Math.abs(amount), costLYD: 0, vodafoneNumber: '01000000000', status: amount > 0 ? 'deposit' : 'deduction', customId: `DEP-${Date.now().toString().slice(-6)}`, companyName: comp.name, employeeName: amount > 0 ? 'الإدارة (إيداع)' : 'الإدارة (خصم)', notes: notes });
-            const actionType = amount > 0 ? 'إيداع/شحن رصيد' : 'خصم من الرصيد'; const msg = `💰 <b>إشعار مالي من الإدارة (${actionType})</b>\n\n💵 المبلغ: <b>${Math.abs(amount).toFixed(2)} دينار/EGP</b>\n📝 الملاحظة: ${notes || 'لا يوجد'}\n🧾 رقم العملية: <code>${tx.customId}</code>`;
+        const comp = await ClientBot.findById(req.params.id); if (!comp) return res.redirect('/clients');
+        let amount; try { amount = parseSignedAmount(req.body.amount); } catch (_) { return res.redirect(`/company/${comp._id}`); }
+        const notes = req.body.notes ? req.body.notes.trim() : '';
+        if (comp && amount !== 0) {
+            const result = await recordBalanceAdjustment({
+                entityModel: 'ClientBot',
+                entityId: comp._id,
+                amount,
+                transactionData: { userId: 'admin', clientBotId: comp._id, vodafoneNumber: '01000000000', companyName: comp.name, employeeName: amount > 0 ? 'الإدارة (إيداع)' : 'الإدارة (خصم)', notes },
+                description: amount > 0 ? `إيداع رصيد شركة ${comp.name}` : `خصم رصيد شركة ${comp.name}`
+            });
+            comp.balance = result.balanceAfter;
+            const tx = result.transaction;
+            const actionType = amount > 0 ? 'إيداع/شحن رصيد' : 'خصم من الرصيد'; const msg = `💰 <b>إشعار مالي من الإدارة (${actionType})</b>\n\n💵 المبلغ: <b>${Math.abs(amount).toFixed(2)} دينار/EGP</b>\n💳 الرصيد الحالي: <b>${result.balanceAfter.toFixed(2)}</b>\n📝 الملاحظة: ${notes || 'لا يوجد'}\n🧾 رقم العملية: <code>${tx.customId}</code>`;
             const compAPI = new Telegram(comp.token); const emps = await ClientEmployee.find({ clientBotId: comp._id, status: 'active' }); for(const emp of emps) compAPI.sendMessage(emp.telegramId, msg, { parse_mode: 'HTML' }).catch(()=>{});
         }
         res.redirect(`/company/${comp._id}`);

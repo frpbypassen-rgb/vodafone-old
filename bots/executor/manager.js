@@ -8,12 +8,6 @@ const Employee = require('../../models/Employee');
 const Admin = require('../../models/Admin'); 
 const Settings = require('../../models/Settings'); 
 const ClientBot = require('../../models/ClientBot'); 
-const ClientEmployee = require('../../models/ClientEmployee');
-
-const { updateBalanceWithLedger } = require('../../services/walletService');
-const { generateCustomReceipt } = require('../../services/externalApiService');
-// 🟢 استدعاء محرك التتبع
-const { updateClientTracking, sendClientReceipt } = require('../../services/clientTrackingService');
 
 const proofWizard = require('./scenes/proofScene');
 const employeeRegisterWizard = require('./scenes/employeeRegisterScene');
@@ -267,10 +261,6 @@ const sendDailyAutoClosing = async (botData) => {
 
 const launchExecutorBot = (botData) => {
     try {
-        if (botData.isApiBot || (botData.token && botData.token.startsWith('API_DUMMY'))) {
-            return; 
-        }
-
         if (activeBots.has(botData.token)) return;
         const bot = new Telegraf(botData.token);
         
@@ -349,39 +339,24 @@ const launchExecutorBot = (botData) => {
         });
 
         bot.action(/mgrApproveEmp_(.+)/, async (ctx) => {
-            try {
-                const empId = ctx.match[1];
-                const emp = await Employee.findById(empId);
-                if (!emp || emp.status !== 'pending') {
-                    return ctx.editMessageText('⚠️ تمت معالجة هذا الطلب مسبقاً.').catch(()=>{});
-                }
-                
-                await Employee.updateOne({ _id: empId }, { $set: { status: 'active' } });
-                
-                await ctx.editMessageText(`✅ <b>تم قبول الموظف:</b> ${emp.name} بنجاح.`, {parse_mode:'HTML'}).catch(()=>{});
-                await ctx.telegram.sendMessage(emp.telegramId, `🎉 <b>مبارك!</b>\nقام المدير بالموافقة على انضمامك لفريق العمل.\n\nاضغط /start لفتح اللوحة وبدء العمل.`, {parse_mode:'HTML'}).catch(()=>{});
-            } catch (error) {
-                console.error('Approval Error:', error.message);
-                await ctx.answerCbQuery('❌ حدث خطأ داخلي أثناء القبول.').catch(()=>{});
-            }
+            const empId = ctx.match[1];
+            const emp = await Employee.findById(empId);
+            if (!emp || emp.status !== 'pending') return ctx.editMessageText('⚠️ تمت معالجة هذا الطلب مسبقاً.');
+            
+            emp.status = 'active';
+            await emp.save();
+            await ctx.editMessageText(`✅ <b>تم قبول الموظف:</b> ${emp.name} بنجاح.`, {parse_mode:'HTML'});
+            await ctx.telegram.sendMessage(emp.telegramId, `🎉 <b>مبارك!</b>\nقام المدير بالموافقة على انضمامك لفريق العمل.\n\nاضغط /start لفتح اللوحة وبدء العمل.`, {parse_mode:'HTML'}).catch(()=>{});
         });
 
         bot.action(/mgrRejectEmp_(.+)/, async (ctx) => {
-            try {
-                const empId = ctx.match[1];
-                const emp = await Employee.findById(empId);
-                if (!emp || emp.status !== 'pending') {
-                    return ctx.editMessageText('⚠️ تمت معالجة هذا الطلب مسبقاً.').catch(()=>{});
-                }
-                
-                await Employee.deleteOne({ _id: empId });
-                
-                await ctx.editMessageText(`❌ تم رفض وحذف طلب الموظف: ${emp.name}.`).catch(()=>{});
-                await ctx.telegram.sendMessage(emp.telegramId, `❌ عذراً، تم رفض طلب انضمامك من قبل المدير.`, {parse_mode:'HTML'}).catch(()=>{});
-            } catch (error) {
-                console.error('Rejection Error:', error.message);
-                await ctx.answerCbQuery('❌ حدث خطأ داخلي أثناء الرفض.').catch(()=>{});
-            }
+            const empId = ctx.match[1];
+            const emp = await Employee.findById(empId);
+            if (!emp || emp.status !== 'pending') return ctx.editMessageText('⚠️ تمت معالجة هذا الطلب مسبقاً.');
+            
+            await Employee.findByIdAndDelete(empId);
+            await ctx.editMessageText(`❌ تم رفض وحذف طلب الموظف: ${emp.name}.`);
+            await ctx.telegram.sendMessage(emp.telegramId, `❌ عذراً، تم رفض طلب انضمامك من قبل المدير.`, {parse_mode:'HTML'}).catch(()=>{});
         });
 
         bot.hears('🟠 الطلبات المعلقة', async (ctx) => {
@@ -400,7 +375,7 @@ const launchExecutorBot = (botData) => {
                 let accDetails = `📞 <b>الرقم/الحساب:</b> <code>${tx.vodafoneNumber || tx.accountNumber || '---'}</code>\n`;
                 if(tx.accountName) accDetails += `👤 <b>الاسم:</b> ${tx.accountName}\n`;
 
-                const textMsg = `🔔 <b>طلب معلق (${typeLabel}):</b>\n${accDetails}\n💵 المبلغ: ${tx.amount} EGP\n🧾 الطلب: <code>${tx.customId || tx._id}</code>\n${tx.get('isApiReview') ? '⚠️ <b>[قيد المراجعة البشرية API]</b>' : ''}`;
+                const textMsg = `🔔 <b>طلب معلق (${typeLabel}):</b>\n${accDetails}\n💵 المبلغ: ${tx.amount} EGP\n🧾 الطلب: <code>${tx.customId || tx._id}</code>`;
                 const keyboard = Markup.inlineKeyboard([[Markup.button.callback('🤝 قبول المهمة', `accept_task_${tx._id}`)], [Markup.button.callback('❌ رفض', `reject_task_${tx._id}`)]]);
 
                 let sentMsg;
@@ -425,6 +400,7 @@ const launchExecutorBot = (botData) => {
             }
         });
 
+        // 🛡️ القبول الذري للمهمة في التليجرام (Atomic Accept) لمنع التضارب
         bot.action(/accept_task_(.+)/, async (ctx) => {
             if (botData.isManagerBot) return;
             
@@ -433,6 +409,7 @@ const launchExecutorBot = (botData) => {
 
             const txId = ctx.match[1];
             try {
+                // التحديث لا يتم إلا إذا كانت المهمة لا تزال processing
                 const tx = await Transaction.findOneAndUpdate(
                     { _id: txId, status: 'processing' },
                     { $set: { status: 'accepted', operatorId: ctx.from.id.toString(), executorName: empOp ? empOp.name : ctx.from.first_name, emergencyAlert: undefined } },
@@ -440,9 +417,6 @@ const launchExecutorBot = (botData) => {
                 );
 
                 if (!tx) return ctx.answerCbQuery('⚠️ هذا الطلب تم قبوله أو معالجته مسبقاً!', { show_alert: true });
-
-                // 🟢 السحر هنا: تحديث لوحة العميل الحية إلى (🔄 جاري العمل عليها)
-                await updateClientTracking(tx._id, 'accepted');
 
                 let typeLabel = 'فودافون كاش';
                 if(tx.transferType === 'post_account') typeLabel = 'حساب بريد';
@@ -455,21 +429,13 @@ const launchExecutorBot = (botData) => {
                                 `🧾 <b>رقم الطلب:</b> <code>${tx.customId || tx._id}</code>\n` + 
                                 accDetails + 
                                 `💵 <b>المبلغ المطلوب:</b> ${tx.amount} EGP\n` + 
-                                `${tx.notes ? `📝 <b>ملاحظة:</b> ${tx.notes}\n` : ''}━━━━━━━━━━━━━━`;
+                                `${tx.notes ? `📝 <b>ملاحظة العميل:</b> ${tx.notes}\n` : ''}━━━━━━━━━━━━━━`;
 
-                let keyboard;
-                if (tx.get('isApiReview')) {
-                    keyboard = Markup.inlineKeyboard([
-                        [Markup.button.callback('✅ تأكيد التنفيذ (بدون إثبات)', `api_confirm_${txId}`)],
-                        [Markup.button.callback('🔙 إرجاع للإدارة (مع ذكر السبب)', `api_return_${txId}`)]
-                    ]);
-                } else {
-                    keyboard = Markup.inlineKeyboard([
-                        [Markup.button.callback('✅ تم التحويل (ارفق الإثبات)', `done_task_${txId}`)],
-                        [Markup.button.callback('✏️ تعديل المبلغ (مع ذكر السبب)', `editAmount_${txId}`)],
-                        [Markup.button.callback('❌ إلغاء الحوالة (يوجد مشكلة)', `cancelExec_${txId}`)]
-                    ]);
-                }
+                const keyboard = Markup.inlineKeyboard([
+                    [Markup.button.callback('✅ تم التحويل (ارفق الإثبات)', `done_task_${txId}`)],
+                    [Markup.button.callback('✏️ تعديل المبلغ (مع ذكر السبب)', `editAmount_${txId}`)],
+                    [Markup.button.callback('❌ إلغاء الحوالة (يوجد مشكلة)', `cancelExec_${txId}`)]
+                ]);
 
                 let savedMsgId = null;
                 if (ctx.callbackQuery.message.photo) {
@@ -506,67 +472,6 @@ const launchExecutorBot = (botData) => {
             } catch (err) {}
         });
 
-        bot.action(/api_confirm_(.+)/, async (ctx) => {
-            try {
-                const txId = ctx.match[1];
-                const tx = await Transaction.findById(txId);
-                if (!tx || tx.status !== 'accepted') return ctx.answerCbQuery('⚠️ الطلب لم يعد متاحاً للتأكيد.');
-
-                await ctx.editMessageText('⏳ <b>جاري تأكيد التنفيذ وتوليد الإيصال الآلي...</b>', { parse_mode: 'HTML' }).catch(()=>{});
-
-                const apiResult = tx.get('apiResultData');
-                const apiBotId = tx.get('originalApiBotId');
-
-                tx.status = 'completed';
-                tx.notes = (tx.notes || '') + '\n[تم التأكيد البشري للإيصال الآلي]';
-                
-                await updateBalanceWithLedger('ExecutorBot', apiBotId, -tx.amount, 'TRANSFER', tx.customId, 'تنفيذ API (تأكيد بشري)');
-
-                const receiptBuffer = await generateCustomReceipt(tx, apiResult);
-                let savedFileId = null;
-
-                const adminAPI = new Telegram(process.env.ADMIN_BOT_TOKEN);
-                const admins = await Admin.find({});
-                const adminCaption = `🤖👨‍💻 <b>تم التنفيذ (API + تأكيد بشري)!</b>\nالطلب <code>${tx.customId}</code> بقيمة ${tx.amount} EGP.\nأكده: ${tx.executorName}`;
-
-                for (const admin of admins) {
-                    if (admin.telegramId) {
-                        try {
-                            if (receiptBuffer) {
-                                const sentAdminMsg = await adminAPI.sendPhoto(admin.telegramId, savedFileId || { source: receiptBuffer }, { caption: adminCaption, parse_mode: 'HTML' });
-                                if (!savedFileId && sentAdminMsg.photo) savedFileId = sentAdminMsg.photo[sentAdminMsg.photo.length - 1].file_id;
-                            } else {
-                                await adminAPI.sendMessage(admin.telegramId, adminCaption, { parse_mode: 'HTML' });
-                            }
-                        } catch (e) {}
-                    }
-                }
-
-                if (savedFileId) { tx.proofImage = savedFileId; tx.proofImages = [savedFileId]; }
-                
-                tx.set('isApiReview', undefined, {strict:false});
-                tx.set('apiResultData', undefined, {strict:false});
-                tx.set('originalApiBotId', undefined, {strict:false});
-                await tx.save();
-
-                // 🟢 السحر هنا: تحديث لوحة العميل الحية إلى (✅ اكتملت بنجاح) ثم إرسال الصورة كرد!
-                await updateClientTracking(tx._id, 'completed');
-                if (receiptBuffer) {
-                    await sendClientReceipt(tx._id, { source: receiptBuffer });
-                }
-
-                await ctx.reply('✅ تمت العملية بنجاح وتم إرسال الإيصال الآلي للعميل.');
-            } catch(e) {
-                console.error(e);
-                ctx.reply('❌ حدث خطأ أثناء التأكيد.');
-            }
-        });
-
-        bot.action(/api_return_(.+)/, async (ctx) => {
-            ctx.session.awaitingApiReturnReason = ctx.match[1];
-            await ctx.editMessageText('✏️ <b>الرجاء كتابة سبب إرجاع هذه العملية للإدارة الآن في رسالة نصية:</b>', {parse_mode: 'HTML'}).catch(()=>{});
-        });
-
         bot.action(/reject_task_(.+)/, async (ctx) => {
             if (botData.isManagerBot) return;
             const txId = ctx.match[1];
@@ -575,9 +480,6 @@ const launchExecutorBot = (botData) => {
                 if (!tx || tx.status !== 'processing') return ctx.answerCbQuery('⚠️ الطلب غير متاح.');
                 tx.status = 'pending'; tx.executorBotId = null; tx.broadcastMessages = []; await tx.save();
                 
-                // 🟢 إرجاع لوحة العميل الحية إلى (🟡 قيد المراجعة) لانتظار توجيه جديد
-                await updateClientTracking(tx._id, 'pending');
-
                 if (ctx.callbackQuery.message.photo) {
                     await ctx.editMessageCaption('❌ تم رفض الطلب وإرجاعه للإدارة المركزية.').catch(()=>{});
                 } else {
@@ -624,21 +526,13 @@ const launchExecutorBot = (botData) => {
                                 `🧾 <b>رقم الطلب:</b> <code>${tx.customId || tx._id}</code>\n` + 
                                 accDetails + 
                                 `💵 <b>المبلغ المطلوب:</b> ${tx.amount} EGP\n` + 
-                                `${tx.notes ? `📝 <b>ملاحظة:</b> ${tx.notes}\n` : ''}━━━━━━━━━━━━━━`;
+                                `${tx.notes ? `📝 <b>ملاحظة العميل:</b> ${tx.notes}\n` : ''}━━━━━━━━━━━━━━`;
 
-                let keyboard;
-                if (tx.get('isApiReview')) {
-                    keyboard = Markup.inlineKeyboard([
-                        [Markup.button.callback('✅ تأكيد التنفيذ (بدون إثبات)', `api_confirm_${tx._id}`)],
-                        [Markup.button.callback('🔙 إرجاع للإدارة (مع ذكر السبب)', `api_return_${tx._id}`)]
-                    ]);
-                } else {
-                    keyboard = Markup.inlineKeyboard([
-                        [Markup.button.callback('✅ تم التحويل (ارفق الإثبات)', `done_task_${tx._id}`)],
-                        [Markup.button.callback('✏️ تعديل المبلغ (مع ذكر السبب)', `editAmount_${tx._id}`)],
-                        [Markup.button.callback('❌ إلغاء الحوالة (يوجد مشكلة)', `cancelExec_${tx._id}`)]
-                    ]);
-                }
+                const keyboard = Markup.inlineKeyboard([
+                    [Markup.button.callback('✅ تم التحويل (ارفق الإثبات)', `done_task_${tx._id}`)],
+                    [Markup.button.callback('✏️ تعديل المبلغ (مع ذكر السبب)', `editAmount_${tx._id}`)],
+                    [Markup.button.callback('❌ إلغاء الحوالة (يوجد مشكلة)', `cancelExec_${tx._id}`)]
+                ]);
 
                 if (tx.transferType === 'post_card' && tx.idCardImage) {
                     let idUrl = tx.idCardImage;
@@ -659,29 +553,6 @@ const launchExecutorBot = (botData) => {
         });
 
         bot.on('message', async (ctx) => {
-            if (ctx.session && ctx.session.awaitingApiReturnReason && ctx.message.text) {
-                const txId = ctx.session.awaitingApiReturnReason;
-                ctx.session.awaitingApiReturnReason = null;
-                
-                const tx = await Transaction.findById(txId);
-                if (tx && tx.status === 'accepted') {
-                    tx.status = 'pending';
-                    tx.executorBotId = undefined; 
-                    tx.operatorId = undefined;
-                    tx.executorName = '---';
-                    tx.notes = (tx.notes ? tx.notes + '\n' : '') + `[تم إرجاع API للمراجعة | السبب: ${ctx.message.text}]`;
-                    tx.set('isApiReview', undefined, {strict:false});
-                    await tx.save();
-
-                    // 🟢 إرجاع لوحة العميل الحية إلى (🟡 قيد المراجعة) لانتظار توجيه جديد
-                    await updateClientTracking(tx._id, 'pending');
-
-                    await ctx.reply('✅ تم سحب الطلب وإرجاعه للإدارة المركزية بنجاح.');
-                    broadcastToAdmins(`⚠️ <b>تنبيه مراجعة!</b>\nقام الموظف بإرجاع طلب API <code>${tx.customId}</code>\nالسبب: <b>${ctx.message.text}</b>`, {parse_mode: 'HTML'});
-                }
-                return;
-            }
-
             if (ctx.message.reply_to_message && ctx.message.reply_to_message.text && ctx.message.reply_to_message.text.includes('الرقم الذي تم إرسال الحوالة منه')) return;
 
             if (ctx.message.text && ctx.message.text.startsWith('comp_')) {

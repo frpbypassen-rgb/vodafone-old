@@ -1,13 +1,8 @@
-// bots/executor/scenes/editAmountScene.js
 const { Scenes, Markup, Telegram } = require('telegraf');
-const axios = require('axios');
-const fs = require('fs');
-const path = require('path');
 const Transaction = require('../../../models/Transaction');
 const ClientBot = require('../../../models/ClientBot');
 const Admin = require('../../../models/Admin');
 const User = require('../../../models/User');
-const { updateClientTracking } = require('../../../services/clientTrackingService');
 
 const editPrompt = async (ctx, text, markup = {}) => {
     try {
@@ -71,7 +66,7 @@ const editAmountWizard = new Scenes.WizardScene(
                 return;
             }
 
-            await editPrompt(ctx, '⏳ <i>جاري معالجة الإثبات وإغلاق الطلب...</i>');
+            await editPrompt(ctx, '⏳ <i>جاري معالجة الإثبات وإغلاق الطلب وإشعار الإدارة...</i>');
             const photoId = ctx.message.photo[ctx.message.photo.length - 1].file_id;
             
             try {
@@ -79,63 +74,71 @@ const editAmountWizard = new Scenes.WizardScene(
                 const oldAmount = tx.amount;
                 const oldLYD = tx.costLYD;
                 const newAmount = ctx.wizard.state.newAmount;
-
-                let originalNote = tx.notes ? tx.notes.split('\n[')[0].split('\n---')[0].trim() : '';
-                let noteText = originalNote ? `\n📝 <b>ملاحظة العميل:</b> ${originalNote}` : '';
-
+                
                 const newLYD = parseFloat((newAmount / tx.exchangeRate).toFixed(3));
                 const refundLYD = oldLYD - newLYD;
 
-                // 🟢 سحب الصورة وحفظها كملف فعلي
-                let photoBuffer = null;
-                let localImagePath = null;
-                try {
-                    const fileLink = await ctx.telegram.getFileLink(photoId);
-                    const response = await axios.get(fileLink.href, { responseType: 'arraybuffer' });
-                    photoBuffer = Buffer.from(response.data);
-
-                    const uploadDir = path.join(process.cwd(), 'uploads', 'proofs');
-                    if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
-                    const fileName = `proof_${tx._id}_${Date.now()}.jpg`;
-                    fs.writeFileSync(path.join(uploadDir, fileName), photoBuffer);
-                    localImagePath = `/uploads/proofs/${fileName}`;
-                } catch (fetchErr) {}
-
                 tx.amount = newAmount;
                 tx.costLYD = newLYD;
-                tx.proofImage = photoId;
-                tx.proofImages = [photoId];
+                
+                const fileLink = await ctx.telegram.getFileLink(photoId);
+                tx.proofImage = fileLink.href;
                 tx.status = 'completed';
-                tx.set('localProofImage', localImagePath, { strict: false }); // 🟢 الحفظ بالهارد ديسك
+                tx.notes = (tx.notes ? tx.notes + ' | ' : '') + `تعديل مبلغ من ${oldAmount} إلى ${newAmount}`;
                 await tx.save();
+
+                let imageBuffer = null;
+                try {
+                    const response = await fetch(fileLink.href);
+                    imageBuffer = Buffer.from(await response.arrayBuffer());
+                } catch (fetchErr) {}
 
                 if (refundLYD > 0) {
                     if (tx.clientBotId) await ClientBot.findByIdAndUpdate(tx.clientBotId, { $inc: { balance: refundLYD } });
                     else await User.findOneAndUpdate({ telegramId: tx.userId }, { $inc: { balance: refundLYD } });
                 }
 
-                const refundNote = `تم تحويل ${newAmount} جنيه بدلاً من ${oldAmount} جنيه، وإرجاع ${refundLYD.toFixed(2)} دينار لرصيدك.`;
-                await updateClientTracking(tx._id, 'completed_modified', refundNote, photoBuffer);
+                let clientAPI;
+                if (tx.clientBotId) {
+                    const comp = await ClientBot.findById(tx.clientBotId);
+                    if (comp) clientAPI = new Telegram(comp.token);
+                }
+                if (!clientAPI) clientAPI = new Telegram(process.env.CLIENT_BOT_TOKEN);
+                
+                const clientMsg = `✅ <b>تم تنفيذ طلبك جزئياً!</b>\n\n🧾 الطلب: <code>${tx.customId || tx._id}</code>\n⚠️ <b>ملاحظة:</b> تم التحويل بمبلغ ${newAmount} EGP (بدلاً من ${oldAmount} EGP)\n💰 <b>تم إرجاع الفارق:</b> ${refundLYD.toFixed(2)} دينار لحسابك.\n\n<i>مرفق الإثبات أدناه.</i>`;
+                
+                try { 
+                    if (imageBuffer) {
+                        await clientAPI.sendPhoto(tx.userId, { source: imageBuffer }, { caption: clientMsg, parse_mode: 'HTML' }); 
+                    } else {
+                        await clientAPI.sendMessage(tx.userId, clientMsg, { parse_mode: 'HTML' });
+                    }
+                } catch(e){}
 
                 const adminAPI = new Telegram(process.env.ADMIN_BOT_TOKEN);
                 const adminMsg = `⚠️ <b>تم تنفيذ حوالة بنجاح (مع تعديل المبلغ)!</b>\n\n` +
+                                 `👤 <b>الجهة/العميل:</b> ${tx.companyName || 'عميل فردي'}\n` +
+                                 `👤 <b>اسم المرسل:</b> ${tx.employeeName || 'غير مسجل'}\n` +
+                                 `🤖 <b>بواسطة بوت:</b> ${tx.executorBotName || 'غير محدد'}\n` +
+                                 `👨‍💻 <b>الموظف المنفذ:</b> ${tx.executorName || 'غير محدد'}\n` +
+                                 `━━━━━━━━━━━━━━\n` +
                                  `🧾 <b>رقم الطلب:</b> <code>${tx.customId || tx._id}</code>\n` +
                                  `📞 <b>الرقم المحول إليه:</b> <code>${tx.vodafoneNumber}</code>\n` +
                                  `💵 <b>المبلغ الجديد:</b> ${newAmount} EGP (كان ${oldAmount})\n` +
-                                 `💰 <b>تم إرجاع:</b> ${refundLYD.toFixed(2)} LYD للعميل.` + noteText;
+                                 `💰 <b>تم إرجاع:</b> ${refundLYD.toFixed(2)} LYD للعميل.`;
 
                 const allAdmins = await Admin.find({});
                 for (const admin of allAdmins) {
                     try {
-                        if (photoBuffer) {
-                            await adminAPI.sendPhoto(admin.telegramId, { source: photoBuffer }, { caption: adminMsg, parse_mode: 'HTML' });
+                        if (imageBuffer) {
+                            await adminAPI.sendPhoto(admin.telegramId, { source: imageBuffer }, { caption: adminMsg, parse_mode: 'HTML' });
                         } else {
                             await adminAPI.sendMessage(admin.telegramId, adminMsg, { parse_mode: 'HTML' });
                         }
                     } catch (adminErr) {}
                 }
 
-                await editPrompt(ctx, `✅ <b>اكتملت العملية بنجاح وتم الرفع!</b>\n\nتم التنفيذ بمبلغ ${newAmount} واسترجاع الفارق للعميل.`, {});
+                await editPrompt(ctx, `✅ <b>اكتملت العملية بنجاح!</b>\n\nتم تنفيذ الطلب بمبلغ ${newAmount} واسترجاع الفارق للعميل، وتم الإرسال للإدارة.`, {});
 
             } catch (e) {}
             return ctx.scene.leave();

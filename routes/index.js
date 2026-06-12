@@ -1,10 +1,8 @@
 const express = require('express');
 const router = express.Router();
-const axios = require('axios'); 
-const fs = require('fs');
-const path = require('path');
+const https = require('https');
 const { Telegram } = require('telegraf');
-const bcrypt = require('bcryptjs'); 
+const bcrypt = require('bcryptjs'); // 🟢 تمت إضافة مكتبة التشفير
 
 const Admin = require('../models/Admin');
 const User = require('../models/User');
@@ -17,6 +15,7 @@ const { isAuthenticated } = require('../middlewares/auth');
 // =======================================================
 // 👑 تسجيل دخول الإدارة المركزية
 // =======================================================
+
 router.get('/login', (req, res) => {
     if (req.session.isLoggedIn || req.session.adminId || req.session.adminRole === 'master') return res.redirect('/');
     res.render('login', { error: null });
@@ -32,6 +31,7 @@ router.post('/login', async (req, res) => {
         const safeUsername = username.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
         const usernameRegex = new RegExp(`^${safeUsername}$`, 'i');
 
+        // 1. فحص المدير الأساسي (Master Admin)
         const envAdminUser = (process.env.ADMIN_USERNAME || 'admin').trim();
         const envAdminPass = (process.env.ADMIN_PASSWORD || 'admin').trim();
 
@@ -43,14 +43,21 @@ router.post('/login', async (req, res) => {
             return req.session.save(() => res.redirect('/'));
         }
 
+        // 2. فحص الإدارة الفرعية (Sub-Admins)
+        // 🟢 الترقية السلسة: نبحث بالاسم فقط أولاً
         const admin = await Admin.findOne({ webUsername: usernameRegex }).lean();
         
         if (admin && admin.webPassword) {
             let isMatch = false;
+            
+            // التحقق مما إذا كانت كلمة المرور مشفرة مسبقاً (تبدأ بـ $2)
             if (admin.webPassword.startsWith('$2')) {
                 isMatch = await bcrypt.compare(password, admin.webPassword);
             } else {
+                // إذا لم تكن مشفرة (النظام القديم)
                 isMatch = (password === admin.webPassword);
+                
+                // 🟢 إذا تطابقت، نقوم بتشفيرها فوراً وحفظها (Auto-Upgrade)
                 if (isMatch) {
                     const hashedPass = await bcrypt.hash(password, 12);
                     await Admin.updateOne({ _id: admin._id }, { webPassword: hashedPass });
@@ -65,8 +72,11 @@ router.post('/login', async (req, res) => {
                 return req.session.save(() => res.redirect('/'));
             }
         }
+
         return res.render('login', { error: 'بيانات الدخول غير صحيحة.' });
+
     } catch (error) {
+        console.error("Admin Login Error: ", error);
         return res.render('login', { error: 'حدث خطأ داخلي في الخادم.' });
     }
 });
@@ -98,73 +108,57 @@ router.get('/', isAuthenticated, async (req, res) => {
 });
 
 // =======================================================
-// 🖼️ مسار الجلب الوسيط (Proxy) لصور الإثبات في لوحة الإدارة 🚀
+// 🖼️ مسار الجلب الوسيط (Proxy) لصور الإثبات في لوحة الإدارة
 // =======================================================
 router.get(['/proxy/image/:id', '/proxy/image/:id/:index'], isAuthenticated, async (req, res) => {
     try {
-        // 🟢 استخدام .lean() لجلب الداتا كما هي وتخطي حماية Schema
-        const tx = await Transaction.findById(req.params.id).lean();
-        if (!tx) return res.status(404).send('لا توجد عملية');
+        const tx = await Transaction.findById(req.params.id);
+        if (!tx) return res.status(404).send('لا توجد صورة إثبات');
 
-        // 1️⃣ قراءة الصورة من الهارد ديسك (مسار Local Storage) الذي أنشأناه
-        const possiblePaths = [tx.localProofImage, tx.proofImage];
-        for (const p of possiblePaths) {
-            if (p && p.startsWith('/uploads')) {
-                const fullPath = path.join(process.cwd(), p);
-                if (fs.existsSync(fullPath)) {
-                    res.set('Cache-Control', 'public, max-age=31536000');
-                    return res.sendFile(fullPath); // إرسال الملف الفعلي من السيرفر بسرعة البرق ⚡
-                }
-            }
-        }
-
-        // 2️⃣ قراءة الصورة المحقونة في قاعدة البيانات كـ Base64
-        if (tx.proofImageBase64) {
-            const b64 = tx.proofImageBase64.replace(/^data:image\/\w+;base64,/, "");
-            res.set('Content-Type', 'image/jpeg'); res.set('Cache-Control', 'public, max-age=31536000');
-            return res.send(Buffer.from(b64, 'base64'));
-        }
-
-        // --- (الأكواد القديمة للعمليات السابقة) ---
         const index = req.params.index ? parseInt(req.params.index) : 0;
         let photoId = null;
-        if (tx.proofImages && tx.proofImages.length > index) photoId = tx.proofImages[index];
-        else if (tx.proofImage && index === 0) photoId = tx.proofImage; 
+        
+        if (tx.proofImages && tx.proofImages.length > index) {
+            photoId = tx.proofImages[index];
+        } else if (tx.proofImage && index === 0) {
+            photoId = tx.proofImage; 
+        }
 
         if (!photoId) return res.status(404).send('لا توجد صورة إثبات');
 
-        if (photoId.startsWith('data:image')) {
-            const base64Data = photoId.replace(/^data:image\/\w+;base64,/, "");
-            res.set('Content-Type', 'image/jpeg'); res.set('Cache-Control', 'public, max-age=31536000');
-            return res.send(Buffer.from(base64Data, 'base64'));
-        }
-
-        if (photoId.startsWith('http')) {
-            const response = await axios.get(photoId, { responseType: 'arraybuffer' });
-            res.set('Content-Type', 'image/jpeg'); res.set('Cache-Control', 'public, max-age=31536000');
-            return res.send(Buffer.from(response.data));
-        }
-
-        // البحث في تيليجرام للعمليات القديمة جداً
         let tokensToTry = [];
-        if (tx.executorBotId) { const execBot = await ExecutorBot.findById(tx.executorBotId); if (execBot && execBot.token) tokensToTry.push(execBot.token); }
         if (process.env.ADMIN_BOT_TOKEN) tokensToTry.push(process.env.ADMIN_BOT_TOKEN);
         if (process.env.CLIENT_BOT_TOKEN) tokensToTry.push(process.env.CLIENT_BOT_TOKEN);
-        
-        let fileLink = null;
-        for (const token of [...new Set(tokensToTry)]) {
-            try { const api = new Telegram(token); const link = await api.getFileLink(photoId); if (link && link.href) { fileLink = link.href; break; } } catch (e) {}
-        }
-        
-        if (!fileLink) return res.status(404).send('الصورة غير متاحة لانتهاء صلاحية الرابط القديم');
-        
-        const response = await axios.get(fileLink, { responseType: 'arraybuffer' });
-        res.set('Content-Type', 'image/jpeg'); res.set('Cache-Control', 'public, max-age=31536000');
-        return res.send(Buffer.from(response.data));
 
-    } catch (error) { 
-        console.error('[Web Proxy Error]:', error.message);
-        res.status(500).send('خطأ داخلي'); 
+        if (tx.executorBotId) {
+            const execBot = await ExecutorBot.findById(tx.executorBotId);
+            if (execBot && execBot.token) tokensToTry.push(execBot.token);
+        }
+        if (tx.clientBotId) {
+            const clientBot = await ClientBot.findById(tx.clientBotId);
+            if (clientBot && clientBot.token) tokensToTry.push(clientBot.token);
+        }
+
+        let fileLink = null;
+        for (const token of tokensToTry) {
+            try {
+                const api = new Telegram(token);
+                fileLink = await api.getFileLink(photoId);
+                if (fileLink) break; 
+            } catch(e) {}
+        }
+
+        if (!fileLink) return res.status(404).send('لا يمكن الوصول للصورة بسبب صلاحيات تيليجرام');
+
+        https.get(fileLink.href, (response) => {
+            res.set('Content-Type', response.headers['content-type']);
+            response.pipe(res);
+        }).on('error', (e) => {
+            res.status(500).send('خطأ في جلب الصورة من تيليجرام');
+        });
+    } catch (error) {
+        console.error(error);
+        res.status(500).send('خطأ داخلي في الخادم');
     }
 });
 

@@ -1,426 +1,511 @@
-// routes/mobileApi.js
 const express = require('express');
 const router = express.Router();
-const jwt = require('jsonwebtoken');
-const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken'); 
+const bcrypt = require('bcryptjs'); 
 const mongoose = require('mongoose');
-const { Telegram } = require('telegraf');
-const axios = require('axios');
 
 const User = require('../models/User');
-const ClientBot = require('../models/ClientBot');
 const ClientEmployee = require('../models/ClientEmployee');
-const ExecutorBot = require('../models/ExecutorBot');
-const Employee = require('../models/Employee');
+const Employee = require('../models/Employee'); 
 const Transaction = require('../models/Transaction');
+const Ledger = require('../models/Ledger'); // 🟢 استدعاء دفتر الأستاذ الجديد
 const Settings = require('../models/Settings');
+const ClientBot = require('../models/ClientBot');
+const ExecutorBot = require('../models/ExecutorBot'); 
+const Admin = require('../models/Admin');
+const Counter = require('../models/Counter');
+const { Telegram } = require('telegraf');
 
-const { updateBalanceWithLedger } = require('../services/walletService');
-const apiTransferQueue = require('../services/queueService');
+const { authenticateJWT, JWT_SECRET, JWT_REFRESH_SECRET } = require('../middlewares/jwtAuth');
 
-const JWT_SECRET = process.env.JWT_SECRET || 'ahram-mobile-super-secret-key-2026';
-const JWT_REFRESH_SECRET = process.env.JWT_REFRESH_SECRET || 'ahram-mobile-refresh-secret-key-2026';
-
-// ==========================================
-// 🛠️ Helper: توحيد صيغة الأخطاء والردود
-// ==========================================
-const sendError = (res, statusCode, code, message) => {
-    return res.status(statusCode).json({ success: false, code, message });
-};
-
-const sendSuccess = (res, data) => {
-    return res.status(200).json({ success: true, ...data });
-};
-
-// ==========================================
-// 🔐 Middleware: حماية المسارات
-// ==========================================
-const requireMobileAuth = async (req, res, next) => {
-    try {
-        const authHeader = req.headers.authorization;
-        if (!authHeader || !authHeader.startsWith('Bearer ')) return sendError(res, 401, 'TOKEN_MISSING', 'توكن المصادقة مفقود.');
-
-        const token = authHeader.split(' ')[1];
-        const decoded = jwt.verify(token, JWT_SECRET);
-        
-        let account = null;
-        if (decoded.accountType === 'client_user') account = await User.findById(decoded.id);
-        else if (decoded.accountType === 'client_company') account = await ClientEmployee.findById(decoded.id);
-        else if (decoded.accountType === 'executor') account = await Employee.findById(decoded.id);
-
-        if (!account) return sendError(res, 401, 'TOKEN_INVALID', 'الحساب غير موجود.');
-        if (account.status !== 'active') return sendError(res, 403, 'ACCOUNT_BANNED', 'هذا الحساب محظور أو غير مفعل.');
-
-        req.user = { id: account._id, accountType: decoded.accountType, ...account._doc };
-        next();
-    } catch (error) {
-        if (error.name === 'TokenExpiredError') return sendError(res, 401, 'TOKEN_EXPIRED', 'انتهت صلاحية الجلسة.');
-        return sendError(res, 401, 'TOKEN_INVALID', 'توكن غير صالح.');
-    }
-};
-
-// ==========================================
-// 🚀 Authentication Routes
-// ==========================================
-
+// =======================================================
+// 1️⃣ نظام تسجيل الدخول وتجديد التوكن
+// =======================================================
 router.post('/login', async (req, res) => {
     try {
         const { username, password } = req.body;
-        if (!username || !password) return sendError(res, 400, 'MISSING_DATA', 'يرجى إرسال اسم المستخدم وكلمة المرور.');
+        if (!username || !password) return res.status(400).json({ success: false, code: 'MISSING_DATA', message: 'يرجى إدخال البيانات' });
 
-        const safeUsername = username.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-        const usernameRegex = new RegExp(`^${safeUsername}$`, 'i');
+        const searchUser = username.trim().toLowerCase();
+        const searchPass = password.trim();
 
-        let account = null;
-        let accountType = '';
-        let balance = 0;
+        let account = null; let accountType = ''; let finalBalance = 0; let telegramId = null; let executorBotId = null;
 
-        // فحص العملاء
-        account = await User.findOne({ $or: [{ webUsername: usernameRegex }, { phone: username.trim() }] }).lean();
-        if (account) { accountType = 'client_user'; balance = account.balance; }
-        
-        // فحص الشركات
-        if (!account) {
-            account = await ClientEmployee.findOne({ $or: [{ webUsername: usernameRegex }, { phone: username.trim() }] }).lean();
-            if (account) {
-                accountType = 'client_company';
-                const comp = await ClientBot.findById(account.clientBotId).lean();
-                balance = comp ? comp.balance : 0;
+        let userDoc = await User.findOne({ $or: [{ webUsername: searchUser }, { phone: username }] });
+        if (userDoc) {
+            let isMatch = false;
+            if (userDoc.webPassword && userDoc.webPassword.startsWith('$2')) { isMatch = await bcrypt.compare(searchPass, userDoc.webPassword); } 
+            else { isMatch = (searchPass === userDoc.webPassword); if (isMatch) await User.updateOne({ _id: userDoc._id }, { webPassword: await bcrypt.hash(searchPass, 12) }); }
+            if (isMatch) { 
+                if (userDoc.status !== 'active') return res.status(403).json({ success: false, code: 'ACCOUNT_BANNED', message: 'الحساب معلق' });
+                account = userDoc; accountType = 'client_user'; finalBalance = userDoc.balance; telegramId = userDoc.telegramId; 
             }
         }
 
-        // فحص المنفذين
         if (!account) {
-            account = await Employee.findOne({ phone: username.trim() }).lean();
-            if (account) accountType = 'executor';
-        }
-
-        if (!account) return sendError(res, 401, 'INVALID_CREDENTIALS', 'بيانات الدخول غير صحيحة.');
-
-        let isMatch = false;
-        if (accountType === 'executor') {
-            isMatch = (password === account.phone); 
-        } else {
-            if (account.webPassword && account.webPassword.startsWith('$2')) {
-                isMatch = await bcrypt.compare(password, account.webPassword);
-            } else {
-                isMatch = (password === account.webPassword);
+            let empDoc = await ClientEmployee.findOne({ $or: [{ webUsername: searchUser }, { phone: username }] });
+            if (empDoc) {
+                let isMatch = false;
+                if (empDoc.webPassword && empDoc.webPassword.startsWith('$2')) { isMatch = await bcrypt.compare(searchPass, empDoc.webPassword); } 
+                else { isMatch = (searchPass === empDoc.webPassword); if (isMatch) await ClientEmployee.updateOne({ _id: empDoc._id }, { webPassword: await bcrypt.hash(searchPass, 12) }); }
+                if (isMatch) {
+                    if (empDoc.status !== 'active') return res.status(403).json({ success: false, code: 'ACCOUNT_BANNED', message: 'الحساب معلق' });
+                    account = empDoc; accountType = 'client_company'; telegramId = empDoc.telegramId;
+                    const company = await ClientBot.findById(empDoc.clientBotId);
+                    finalBalance = company ? company.balance : 0;
+                }
             }
         }
 
-        if (!isMatch) return sendError(res, 401, 'INVALID_CREDENTIALS', 'بيانات الدخول غير صحيحة.');
-        if (account.status !== 'active') return sendError(res, 403, 'ACCOUNT_BANNED', 'حسابك معلق حالياً.');
+        if (!account) {
+            let execDoc = await Employee.findOne({ $or: [{ webUsername: searchUser }, { phone: username }] }).populate('botId');
+            if (execDoc) {
+                let isMatch = false;
+                if (execDoc.webPassword && execDoc.webPassword.startsWith('$2')) { isMatch = await bcrypt.compare(searchPass, execDoc.webPassword); } 
+                else { isMatch = (searchPass === execDoc.webPassword); if (isMatch) await Employee.updateOne({ _id: execDoc._id }, { webPassword: await bcrypt.hash(searchPass, 12) }); }
+                if (isMatch) {
+                    if (execDoc.status !== 'active') return res.status(403).json({ success: false, code: 'ACCOUNT_BANNED', message: 'الحساب معلق' });
+                    account = execDoc; accountType = 'executor'; telegramId = execDoc.telegramId;
+                    executorBotId = execDoc.botId ? execDoc.botId._id : null;
+                    finalBalance = execDoc.botId ? execDoc.botId.balance : 0;
+                }
+            }
+        }
 
-        const payload = { id: account._id, accountType };
-        const token = jwt.sign(payload, JWT_SECRET, { expiresIn: '12h' });
-        const refreshToken = jwt.sign(payload, JWT_REFRESH_SECRET, { expiresIn: '30d' });
+        if (!account) return res.status(401).json({ success: false, code: 'INVALID_CREDENTIALS', message: 'بيانات الدخول غير صحيحة' });
 
-        return sendSuccess(res, {
-            token,
-            refreshToken,
-            accountType,
-            id: account._id,
-            name: account.name,
-            balance: accountType === 'executor' ? 0 : balance,
-            expiresIn: 12 * 3600
-        });
+        const accessToken = jwt.sign({ userId: account._id, accountType, telegramId, executorBotId }, JWT_SECRET, { expiresIn: '1h' });
+        const refreshToken = jwt.sign({ userId: account._id, accountType }, JWT_REFRESH_SECRET, { expiresIn: '30d' });
 
-    } catch (e) {
-        return sendError(res, 500, 'SERVER_ERROR', 'خطأ داخلي في الخادم.');
-    }
+        const Model = accountType === 'executor' ? Employee : (accountType === 'client_company' ? ClientEmployee : User);
+        await Model.updateOne({ _id: account._id }, { $set: { refreshToken: refreshToken } }, { strict: false });
+
+        res.json({ success: true, token: accessToken, refreshToken: refreshToken, accountType, id: account._id, name: account.name, balance: finalBalance });
+    } catch (error) { res.status(500).json({ success: false, code: 'SERVER_ERROR', message: 'خطأ في السيرفر' }); }
 });
 
 router.post('/refresh-token', async (req, res) => {
-    try {
-        const { refreshToken } = req.body;
-        if (!refreshToken) return sendError(res, 400, 'TOKEN_MISSING', 'يرجى إرسال الـ Refresh Token.');
+    const { refreshToken } = req.body;
+    if (!refreshToken) return res.status(401).json({ success: false, code: 'TOKEN_MISSING', message: 'توكن التحديث مفقود' });
 
-        const decoded = jwt.verify(refreshToken, JWT_REFRESH_SECRET);
-        const payload = { id: decoded.id, accountType: decoded.accountType };
-        
-        const newToken = jwt.sign(payload, JWT_SECRET, { expiresIn: '12h' });
-        
-        return sendSuccess(res, {
-            token: newToken,
-            refreshToken: refreshToken, // يظل القديم صالحاً حتى تنتهي الـ 30 يوم
-            expiresIn: 12 * 3600
-        });
-    } catch (e) {
-        return sendError(res, 401, 'SESSION_REVOKED', 'انتهت صلاحية الـ Refresh Token. يرجى تسجيل الدخول مجدداً.');
-    }
-});
+    jwt.verify(refreshToken, JWT_REFRESH_SECRET, async (err, decoded) => {
+        if (err) return res.status(403).json({ success: false, code: 'TOKEN_INVALID', message: 'توكن غير صالح أو منتهي' });
 
-router.post('/logout', requireMobileAuth, (req, res) => {
-    // في الـ JWT يتم مسح التوكن من جهة الموبايل
-    return sendSuccess(res, { message: 'تم تسجيل الخروج بنجاح.' });
-});
+        const { userId, accountType } = decoded;
+        const Model = accountType === 'executor' ? Employee : (accountType === 'client_company' ? ClientEmployee : User);
+        const account = await Model.findById(userId).populate(accountType === 'executor' ? 'botId' : '');
 
-// ==========================================
-// 💼 Client Routes (العملاء)
-// ==========================================
-
-router.post('/client/exchange-rate', requireMobileAuth, async (req, res) => {
-    try {
-        if (req.user.accountType === 'executor') return sendError(res, 403, 'FORBIDDEN', 'غير مصرح.');
-
-        const set = await Settings.findOne({}) || {};
-        let rate = set.rateLevel1;
-        let balance = 0;
-
-        if (req.user.accountType === 'client_user') {
-            rate = req.user.tier === 3 ? set.rateLevel3 : (req.user.tier === 2 ? set.rateLevel2 : set.rateLevel1);
-            balance = req.user.balance;
-        } else if (req.user.accountType === 'client_company') {
-            const comp = await ClientBot.findById(req.user.clientBotId);
-            if (comp) {
-                rate = comp.tier === 3 ? set.rateLevel3 : (comp.tier === 2 ? set.rateLevel2 : set.rateLevel1);
-                balance = comp.balance;
-            }
+        if (!account || account.refreshToken !== refreshToken || account.status !== 'active') {
+            return res.status(403).json({ success: false, code: 'SESSION_REVOKED', message: 'تم إبطال الجلسة' });
         }
 
-        return sendSuccess(res, { exchangeRate: rate, balance });
-    } catch (e) {
-        return sendError(res, 500, 'SERVER_ERROR', 'خطأ في جلب البيانات.');
-    }
+        const telegramId = account.telegramId;
+        const executorBotId = accountType === 'executor' && account.botId ? account.botId._id : null;
+
+        const newAccessToken = jwt.sign({ userId: account._id, accountType, telegramId, executorBotId }, JWT_SECRET, { expiresIn: '1h' });
+        res.json({ success: true, token: newAccessToken });
+    });
 });
 
-router.post('/client/transactions', requireMobileAuth, async (req, res) => {
+router.post('/logout', authenticateJWT, async (req, res) => {
     try {
-        if (req.user.accountType === 'executor') return sendError(res, 403, 'FORBIDDEN', 'غير مصرح.');
+        const { userId, accountType } = req.user;
+        const Model = accountType === 'executor' ? Employee : (accountType === 'client_company' ? ClientEmployee : User);
+        await Model.updateOne({ _id: userId }, { $unset: { refreshToken: 1 } }, { strict: false });
+        res.json({ success: true, message: 'تم تسجيل الخروج وإبطال الجلسة' });
+    } catch(e) { res.status(500).json({ success: false, message: 'خطأ داخلي' }); }
+});
 
+// =======================================================
+// 2️⃣ مسارات العملاء (سجل العمليات والأسعار)
+// =======================================================
+router.post('/client/transactions', authenticateJWT, async (req, res) => {
+    try {
+        const { userId, accountType } = req.user; 
+        if(accountType === 'executor') return res.status(403).json({success: false});
+        let filter = {};
+
+        if (accountType === 'client_company') {
+            const emp = await ClientEmployee.findById(userId);
+            filter.clientBotId = emp.clientBotId;
+        } else {
+            const user = await User.findById(userId);
+            filter.userId = user.telegramId;
+            filter.clientBotId = null;
+        }
+
+        // Pagination Parameter (لتخفيف الضغط على الموبايل)
         const page = parseInt(req.body.page) || 1;
         const limit = parseInt(req.body.limit) || 20;
         const skip = (page - 1) * limit;
 
-        let filter = {};
-        if (req.user.accountType === 'client_user') filter = { userId: req.user.telegramId, clientBotId: null };
-        else if (req.user.accountType === 'client_company') filter = { clientBotId: req.user.clientBotId };
-
-        const total = await Transaction.countDocuments(filter);
-        const transactions = await Transaction.find(filter).sort({ createdAt: -1 }).skip(skip).limit(limit).lean();
-
-        return sendSuccess(res, {
-            page,
-            limit,
-            total,
-            totalPages: Math.ceil(total / limit),
-            hasMore: skip + transactions.length < total,
-            transactions
-        });
-    } catch (e) {
-        return sendError(res, 500, 'SERVER_ERROR', 'خطأ في جلب العمليات.');
-    }
+        const transactions = await Transaction.find(filter).sort({ createdAt: -1 }).skip(skip).limit(limit);
+        res.json({ success: true, transactions, page, limit });
+    } catch (error) { res.status(500).json({ success: false }); }
 });
 
-router.post('/client/new-transfer', requireMobileAuth, async (req, res) => {
+router.post('/client/exchange-rate', authenticateJWT, async (req, res) => {
+    try {
+        const { userId, accountType } = req.user; 
+        const settings = await Settings.findOne({});
+        let finalRate = settings ? (settings.rateLevel1 || 6.40) : 6.40;
+
+        if (accountType === 'client_company') {
+            const emp = await ClientEmployee.findById(userId);
+            if (emp) {
+                const comp = await ClientBot.findById(emp.clientBotId);
+                if (comp) {
+                    const tier = comp.tier || 1;
+                    finalRate = tier === 3 ? settings.rateLevel3 : (tier === 2 ? settings.rateLevel2 : settings.rateLevel1);
+                }
+            }
+        } else if (accountType === 'client_user') {
+            const user = await User.findById(userId);
+            if (user) {
+                const tier = user.tier || 1;
+                finalRate = tier === 3 ? settings.rateLevel3 : (tier === 2 ? settings.rateLevel2 : settings.rateLevel1);
+            }
+        }
+        res.json({ success: true, exchangeRate: finalRate });
+    } catch (error) { res.status(500).json({ success: false, exchangeRate: 1.0, message: "خطأ داخلي بالسيرفر" }); }
+});
+
+// =======================================================
+// 3️⃣ مسار التحويل البنكي المحصن (Idempotency + Ledger + Transactions)
+// =======================================================
+router.post('/client/new-transfer', authenticateJWT, async (req, res) => {
+    // 🟢 بدء المعاملة الذرية (Transaction)
     const session = await mongoose.startSession();
     session.startTransaction();
 
     try {
-        if (req.user.accountType === 'executor') throw new Error('FORBIDDEN');
+        const { transferType, amount, number, name, notes } = req.body;
+        const { userId, accountType } = req.user; 
+        if(accountType === 'executor') throw new Error('FORBIDDEN');
 
-        // 🟢 تطبيق الـ Idempotency Key لمنع التكرار
+        // 🛡️ 1. منع التكرار (Idempotency Check)
         const idempotencyKey = req.headers['idempotency-key'];
-        if (!idempotencyKey) throw new Error('MISSING_IDEMPOTENCY');
-
-        const existingTx = await Transaction.findOne({ idempotencyKey }).session(session);
-        if (existingTx) {
-            await session.abortTransaction();
-            session.endSession();
-            // 🟢 إرجاع استجابة تفيد بأن الطلب مكرر (لكنه ناجح برمجياً حتى لا يتعطل الموبايل)
-            return sendError(res, 409, 'DUPLICATE_IGNORED', 'تم استلام هذا الطلب مسبقاً.');
+        if (idempotencyKey) {
+            const existingTx = await Transaction.findOne({ idempotencyKey }).session(session);
+            if (existingTx) {
+                await session.abortTransaction();
+                session.endSession();
+                return res.json({ success: true, code: 'DUPLICATE_IGNORED', message: 'تم إرسال الطلب بالفعل', txId: existingTx.customId });
+            }
         }
-
-        const { amount, phone, type, notes } = req.body;
-        const parsedAmount = parseFloat(amount);
-
-        if (isNaN(parsedAmount) || parsedAmount <= 0 || !phone) throw new Error('MISSING_DATA');
 
         const settings = await Settings.findOne({}).session(session);
         if (settings && settings.isManualClosed) throw new Error('SYSTEM_CLOSED');
 
-        let rate = settings.rateLevel1;
-        let balanceModel = null;
-        let modelType = '';
-        let telegramId = null;
-        let clientBotId = null;
-        let companyName = 'عميل فردي (موبايل)';
+        let clientDoc, currentRate = settings ? (settings.rateLevel1 || 6.40) : 6.40;
+        let companyName = 'عميل فردي', employeeName = 'غير محدد';
+        let TargetModel, targetId, creditLimit = 0;
+        let telegramIdForTx = null, clientBotIdForTx = null;
 
-        if (req.user.accountType === 'client_user') {
-            rate = req.user.tier === 3 ? settings.rateLevel3 : (req.user.tier === 2 ? settings.rateLevel2 : settings.rateLevel1);
-            balanceModel = req.user;
-            modelType = 'User';
-            telegramId = req.user.telegramId;
+        // 🛡️ 2. تحديد نوع العميل وسحب البيانات
+        if (accountType === 'client_user') {
+            clientDoc = await User.findById(userId).session(session);
+            if (clientDoc) {
+                const tier = clientDoc.tier || 1;
+                currentRate = tier === 3 ? settings.rateLevel3 : (tier === 2 ? settings.rateLevel2 : settings.rateLevel1);
+                employeeName = clientDoc.name; creditLimit = clientDoc.creditLimit || 0;
+                TargetModel = User; targetId = clientDoc._id; telegramIdForTx = clientDoc.telegramId;
+            }
         } else {
-            const comp = await ClientBot.findById(req.user.clientBotId).session(session);
-            rate = comp.tier === 3 ? settings.rateLevel3 : (comp.tier === 2 ? settings.rateLevel2 : settings.rateLevel1);
-            balanceModel = comp;
-            modelType = 'ClientBot';
-            clientBotId = comp._id;
-            companyName = comp.name;
+            const emp = await ClientEmployee.findById(userId).session(session);
+            if (emp) {
+                employeeName = emp.name;
+                clientDoc = await ClientBot.findById(emp.clientBotId).session(session);
+                if (clientDoc) {
+                    companyName = clientDoc.name;
+                    const tier = clientDoc.tier || 1;
+                    currentRate = tier === 3 ? settings.rateLevel3 : (tier === 2 ? settings.rateLevel2 : settings.rateLevel1);
+                    creditLimit = clientDoc.creditLimit || 0;
+                    TargetModel = ClientBot; targetId = clientDoc._id; clientBotIdForTx = clientDoc._id;
+                }
+            }
         }
 
-        if (type === 'post_account') rate -= 0.05;
-        if (type === 'post_card') rate -= 0.15;
+        if (!clientDoc) throw new Error('USER_NOT_FOUND');
 
-        const costLYD = parseFloat((parsedAmount / rate).toFixed(3));
-        const minBalance = costLYD - (balanceModel.creditLimit || 0);
+        let finalRate = currentRate;
+        if (transferType === 'بريد حساب' || transferType === 'post_account') finalRate = currentRate - 0.05;
+        else if (transferType === 'بريد بطاقة' || transferType === 'post_card') finalRate = currentRate - 0.15;
 
-        if (balanceModel.balance < minBalance) throw new Error('INSUFFICIENT_BALANCE');
-
-        // الخصم
-        const Model = modelType === 'User' ? User : ClientBot;
-        const updatedDoc = await Model.findOneAndUpdate(
-            { _id: balanceModel._id, balance: { $gte: minBalance } },
-            { $inc: { balance: -costLYD } },
-            { new: true, session }
+        const costLYD = parseFloat((amount / finalRate).toFixed(3));
+        const minRequiredBalance = costLYD - creditLimit;
+        
+        // 🛡️ 3. خصم الرصيد مع القفل الآمن (Atomic Update)
+        const updatedClient = await TargetModel.findOneAndUpdate(
+            { _id: targetId, balance: { $gte: minRequiredBalance } }, 
+            { $inc: { balance: -costLYD } }, 
+            { new: true, session } 
         );
 
-        if (!updatedDoc) throw new Error('INSUFFICIENT_BALANCE');
+        if (!updatedClient) throw new Error('INSUFFICIENT_BALANCE');
 
+        // 🛡️ 4. توليد رقم تسلسلي للفاتورة
+        const counter = await Counter.findOneAndUpdate(
+            { name: 'transaction' }, { $inc: { value: 1 } }, { upsert: true, new: true, session }
+        );
+        const now = new Date();
+        const yy = now.getFullYear().toString().slice(-2);
+        const mm = (now.getMonth() + 1).toString().padStart(2, '0');
+        const customId = `ATT-${yy}${mm}-${counter.value.toString().padStart(4, '0')}`;
+
+        // 🛡️ 5. إنشاء فاتورة العملية
         const newTx = new Transaction({
-            idempotencyKey,
-            customId: `MOB-${Date.now().toString().slice(-6)}`,
-            userId: telegramId,
-            clientBotId: clientBotId,
-            companyName: companyName,
-            employeeName: req.user.name,
-            vodafoneNumber: phone,
-            transferType: type || 'vodafone',
-            amount: parsedAmount,
-            costLYD: costLYD,
-            exchangeRate: rate,
-            notes: notes || '',
-            status: 'pending'
+            userId: telegramIdForTx, clientBotId: clientBotIdForTx, amount: amount, exchangeRate: finalRate,
+            costLYD: costLYD, transferType: transferType, vodafoneNumber: number, accountName: name, notes: notes,
+            status: 'pending', customId: customId, companyName: companyName, employeeName: employeeName,
+            idempotencyKey: idempotencyKey // حفظ الكود لمنع التكرار
         });
-
         await newTx.save({ session });
+
+        // 🛡️ 6. تسجيل العملية في دفتر الأستاذ (Financial Ledger)
+        const ledgerEntry = new Ledger({
+            entityId: targetId,
+            entityModel: TargetModel.modelName,
+            transactionId: customId,
+            type: 'TRANSFER',
+            amount: -costLYD,
+            balanceBefore: updatedClient.balance + costLYD,
+            balanceAfter: updatedClient.balance,
+            description: `تحويل ${amount} EGP إلى ${number}`
+        });
+        await ledgerEntry.save({ session });
+
+        // 🟢 إتمام العملية وتثبيتها في قاعدة البيانات
         await session.commitTransaction();
         session.endSession();
 
-        // 🔔 إشعارات الإدارة في الخلفية
+        // --- إرسال إشعارات تيليجرام (خارج الـ Transaction لكي لا تعطل الحفظ) ---
         setImmediate(async () => {
             try {
                 const adminAPI = new Telegram(process.env.ADMIN_BOT_TOKEN);
+                let typeLabel = transferType === 'post_account' ? '📮 حساب بريد' : (transferType === 'post_card' ? '💳 بطاقة عميل' : '📱 فودافون كاش');
+                const adminMsg = `🆕 <b>طلب تحويل جديد (تطبيق الموبايل)!</b>\n\n🏢 <b>الجهة:</b> ${companyName}\n👤 <b>بواسطة:</b> ${employeeName}\nنوع التحويل: ${typeLabel}\n📞 <b>الرقم/الحساب:</b> <code>${number}</code>\n${name ? `👤 <b>الاسم:</b> ${name}\n` : ''}💵 <b>المبلغ:</b> ${amount} EGP\n💸 <b>التكلفة:</b> ${costLYD} LYD (السعر: ${finalRate.toFixed(2)})\n🧾 <b>الطلب:</b> <code>${customId}</code>\n${notes ? `📝 <b>ملاحظات:</b> ${notes}` : ''}`;
+                const keyboard = { inline_keyboard: [[{ text: '🤖 توجيه لبوت التنفيذ', callback_data: `forward_${newTx._id}` }], [{ text: '❌ رفض وإلغاء', callback_data: `cancelReq_${newTx._id}` }]] };
                 const admins = await Admin.find({});
-                const msg = `📱 <b>طلب موبايل جديد!</b>\n\n🏢 <b>من:</b> ${companyName}\n📞 <b>المحفظة:</b> <code>${phone}</code>\n💵 <b>المبلغ:</b> ${parsedAmount} EGP\n💰 <b>التكلفة:</b> ${costLYD} LYD`;
-                for (const ad of admins) if (ad.telegramId) adminAPI.sendMessage(ad.telegramId, msg, { parse_mode: 'HTML' }).catch(()=>{});
-            } catch(e) {}
+                let savedAdminMsgs = [];
+                for (const admin of admins) {
+                    if (admin.telegramId && !admin.webUsername) {
+                        try {
+                            const sent = await adminAPI.sendMessage(admin.telegramId, adminMsg, { parse_mode: 'HTML', reply_markup: keyboard });
+                            if(sent) savedAdminMsgs.push({ telegramId: admin.telegramId, messageId: sent.message_id });
+                        } catch(e) {}
+                    }
+                }
+                if (savedAdminMsgs.length > 0) { await Transaction.findByIdAndUpdate(newTx._id, { adminMessages: savedAdminMsgs }); }
+            } catch(err) {}
         });
 
-        return sendSuccess(res, { message: 'تم إرسال الطلب بنجاح', newBalance: updatedDoc.balance });
-
+        res.json({ success: true, code: 'SUCCESS', message: 'تم إرسال طلبك بنجاح', txId: customId, newBalance: updatedClient.balance });
     } catch (error) {
+        // 🔴 التراجع عن كل شيء في حال حدوث أي خطأ برمجي أو في الرصيد
         await session.abortTransaction();
         session.endSession();
 
-        if (error.message === 'MISSING_IDEMPOTENCY') return sendError(res, 400, 'MISSING_DATA', 'معرف الطلب (Idempotency Key) مفقود.');
-        if (error.message === 'FORBIDDEN') return sendError(res, 403, 'FORBIDDEN', 'غير مصرح للقيام بهذه العملية.');
-        if (error.message === 'SYSTEM_CLOSED') return sendError(res, 403, 'SYSTEM_CLOSED', 'النظام مغلق حالياً.');
-        if (error.message === 'MISSING_DATA') return sendError(res, 400, 'MISSING_DATA', 'بيانات التحويل غير مكتملة.');
-        if (error.message === 'INSUFFICIENT_BALANCE') return sendError(res, 400, 'INSUFFICIENT_BALANCE', 'الرصيد غير كافٍ.');
-
-        return sendError(res, 500, 'SERVER_ERROR', 'حدث خطأ داخلي.');
-    }
-});
-
-// ==========================================
-// ⚙️ Executor Routes (المنفذين)
-// ==========================================
-
-router.get('/executor/live-tasks', requireMobileAuth, async (req, res) => {
-    try {
-        if (req.user.accountType !== 'executor') return sendError(res, 403, 'FORBIDDEN', 'مخصص للمنفذين فقط.');
-
-        let myTasks = [];
-        let pendingTasks = [];
-
-        if (req.user.status === 'active') {
-            myTasks = await Transaction.find({ executorBotId: req.user.botId, operatorId: req.user.telegramId, status: 'accepted' }).lean();
-            pendingTasks = await Transaction.find({ executorBotId: req.user.botId, status: 'processing' }).lean();
+        if (error.message === 'INSUFFICIENT_BALANCE') {
+            return res.status(400).json({ success: false, code: 'INSUFFICIENT_BALANCE', message: 'رصيد غير كافٍ أو تغير أثناء العملية' });
+        } else if (error.message === 'SYSTEM_CLOSED') {
+            return res.status(403).json({ success: false, code: 'SYSTEM_CLOSED', message: 'المنظومة مغلقة حالياً' });
+        } else if (error.message === 'FORBIDDEN') {
+            return res.status(403).json({ success: false, code: 'FORBIDDEN', message: 'صلاحيات غير كافية' });
         }
-
-        return sendSuccess(res, { myTasks, pendingTasks });
-    } catch (e) {
-        return sendError(res, 500, 'SERVER_ERROR', 'حدث خطأ في الخادم.');
+        res.status(500).json({ success: false, code: 'SERVER_ERROR', message: 'حدث خطأ داخلي أثناء معالجة الطلب' });
     }
 });
 
-router.post('/executor/accept-task/:id', requireMobileAuth, async (req, res) => {
+// =======================================================
+// 4️⃣ مسارات المنفذين (Executors API)
+// =======================================================
+router.get('/executor/live-tasks', authenticateJWT, async (req, res) => {
     try {
-        if (req.user.accountType !== 'executor') return sendError(res, 403, 'FORBIDDEN', 'غير مصرح.');
-        if (req.user.status !== 'active') return sendError(res, 403, 'INVALID_STATE', 'حسابك غير مفعل لاستلام طلبات.');
+        const { telegramId, executorBotId, accountType } = req.user;
+        if(accountType !== 'executor') return res.status(403).json({success: false});
+
+        const tasks = await Transaction.find({ executorBotId: executorBotId, status: { $in: ['processing', 'accepted'] } }).sort({ createdAt: 1 }).lean(); 
+        const alerts = await Transaction.find({ executorBotId: executorBotId, emergencyAlert: { $exists: true, $ne: null }, status: { $in: ['processing', 'accepted'] } }).lean();
+        res.json({ success: true, tasks, alerts });
+    } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+router.post('/executor/accept-task/:id', authenticateJWT, async (req, res) => {
+    try {
+        const { telegramId, accountType } = req.user;
+        if(accountType !== 'executor') return res.status(403).json({success: false});
+
+        const emp = await Employee.findOne({ telegramId }).populate('botId');
 
         const tx = await Transaction.findOneAndUpdate(
-            { _id: req.params.id, status: 'processing', executorBotId: req.user.botId },
-            { $set: { status: 'accepted', operatorId: req.user.telegramId, executorName: req.user.name } },
+            { _id: req.params.id, status: 'processing' },
+            { $set: { status: 'accepted', operatorId: emp.telegramId, executorName: emp.name, emergencyAlert: undefined } },
             { new: true }
         );
 
-        if (!tx) return sendError(res, 400, 'ALREADY_TAKEN', 'هذا الطلب تم قبوله من قبل موظف آخر أو تم سحبه.');
+        if (!tx) return res.json({ success: false, code: 'ALREADY_TAKEN', message: 'عذراً، تم سحب الطلب من قِبل زميل آخر' });
 
-        return sendSuccess(res, { message: 'تم قبول الطلب بنجاح.', transaction: tx });
-    } catch (e) {
-        return sendError(res, 500, 'SERVER_ERROR', 'حدث خطأ.');
+        if (tx.broadcastMessages && tx.broadcastMessages.length > 0) {
+            const execBotAPI = new Telegram(emp.botId.token);
+            let typeLabel = tx.transferType === 'post_account' ? '📮 حساب بريد' : (tx.transferType === 'post_card' ? '💳 بطاقة عميل' : '📱 فودافون كاش');
+            const msgText = `🔒 <b>تم سحب المهمة (${typeLabel})</b>\n\n📞 الرقم/الحساب: <code>${tx.vodafoneNumber || tx.accountNumber || '---'}</code>\n💵 المبلغ: ${tx.amount} EGP\n🧾 الطلب: <code>${tx.customId}</code>\n\n👨‍💻 <b>تم الاستلام بواسطة:</b> ${emp.name}`;
+            
+            for (const msg of tx.broadcastMessages) {
+                try {
+                    if (tx.transferType === 'post_card' && tx.idCardImage) { await execBotAPI.editMessageCaption(msg.telegramId, msg.messageId, undefined, msgText, { parse_mode: 'HTML', reply_markup: { inline_keyboard: [] } }); } 
+                    else { await execBotAPI.editMessageText(msg.telegramId, msg.messageId, undefined, msgText, { parse_mode: 'HTML', reply_markup: { inline_keyboard: [] } }); }
+                } catch(e) {}
+            }
+        }
+        res.json({ success: true });
+    } catch(e) { res.json({ success: false, message: e.message }); }
+});
+
+router.post('/executor/cancel-task/:id', authenticateJWT, async (req, res) => {
+    const session = await mongoose.startSession();
+    session.startTransaction();
+    try {
+        const { reason } = req.body;
+        const { telegramId, accountType } = req.user;
+        if(accountType !== 'executor') throw new Error('FORBIDDEN');
+
+        const tx = await Transaction.findById(req.params.id).session(session);
+        const emp = await Employee.findOne({ telegramId }).session(session);
+
+        if (tx && tx.status === 'accepted' && tx.operatorId === emp.telegramId) {
+            
+            let targetId, TargetModel;
+            if (tx.clientBotId) { TargetModel = ClientBot; targetId = tx.clientBotId; }
+            else if (tx.userId) { TargetModel = User; targetId = await User.findOne({telegramId: tx.userId}).then(u => u._id); }
+
+            const updatedClient = await TargetModel.findByIdAndUpdate(targetId, { $inc: { balance: tx.costLYD } }, { new: true, session });
+            
+            // تسجيل المرتجع في الدفتر
+            const ledgerEntry = new Ledger({
+                entityId: targetId, entityModel: TargetModel.modelName, transactionId: tx.customId, type: 'REFUND',
+                amount: tx.costLYD, balanceBefore: updatedClient.balance - tx.costLYD, balanceAfter: updatedClient.balance,
+                description: `استرجاع تكلفة حوالة ملغاة (السبب: ${reason})`
+            });
+            await ledgerEntry.save({ session });
+
+            tx.status = 'rejected';
+            tx.notes = (tx.notes ? tx.notes + '\n' : '') + `[تم الإلغاء | المنفذ: ${emp.name} | السبب: ${reason}]`;
+            await tx.save({ session });
+
+            await session.commitTransaction();
+            session.endSession();
+
+            // اشعارات تيليجرام
+            setImmediate(async () => {
+                try {
+                    let clientAPI = tx.clientBotId ? new Telegram((await ClientBot.findById(tx.clientBotId)).token) : new Telegram(process.env.CLIENT_BOT_TOKEN);
+                    const clientMsg = `❌ <b>تم إلغاء طلب التحويل وإرجاع الرصيد!</b>\n\n👤 <b>المرسل:</b> ${tx.employeeName || 'غير محدد'}\n🧾 <b>رقم العملية:</b> <code>${tx.customId || tx._id}</code>\n📞 <b>رقم الهاتف/الحساب:</b> <code>${tx.vodafoneNumber || tx.accountNumber || '---'}</code>\n💵 <b>المبلغ:</b> ${tx.amount} EGP\n⚠️ <b>سبب الإلغاء:</b> ${reason}`;
+                    await clientAPI.sendMessage(tx.userId, clientMsg, { parse_mode: 'HTML' }).catch(()=>{});
+                    
+                    const adminAPI = new Telegram(process.env.ADMIN_BOT_TOKEN);
+                    const adminMsg = `🚨 <b>تنبيه للإدارة: تم إلغاء عملية من قِبل المنفذ!</b>\n\n🏢 <b>الجهة/العميل:</b> ${tx.companyName || 'عميل فردي'}\n🤖 <b>المنفذ:</b> ${emp.name}\n🧾 <b>رقم الطلب:</b> <code>${tx.customId || tx._id}</code>\n💵 <b>المبلغ:</b> ${tx.amount} EGP\n⚠️ <b>السبب:</b> <b>${reason}</b>`;
+                    const allAdmins = await Admin.find({});
+                    for (const admin of allAdmins) { await adminAPI.sendMessage(admin.telegramId, adminMsg, { parse_mode: 'HTML' }).catch(()=>{}); }
+                } catch(e){}
+            });
+
+            return res.json({ success: true, message: 'تم الإلغاء وإرجاع الرصيد بنجاح' });
+        }
+        throw new Error('INVALID_STATE');
+    } catch (e) { 
+        await session.abortTransaction(); session.endSession();
+        res.status(500).json({ success: false, code: e.message === 'INVALID_STATE' ? 'INVALID_STATE' : 'SERVER_ERROR', message: 'فشل الإلغاء' }); 
     }
 });
 
-router.post('/executor/complete-task/:id', requireMobileAuth, async (req, res) => {
+router.post('/executor/complete-task/:id', authenticateJWT, async (req, res) => {
     try {
-        if (req.user.accountType !== 'executor') return sendError(res, 403, 'FORBIDDEN', 'غير مصرح.');
+        const { imageBase64, senderPhone } = req.body;
+        const { telegramId, accountType } = req.user;
+        if(accountType !== 'executor') return res.status(403).json({success: false});
+        if (!imageBase64) return res.json({ success: false, message: 'يرجى إرفاق صورة الإثبات' });
+
+        const tx = await Transaction.findById(req.params.id);
+        const emp = await Employee.findOne({ telegramId }).populate('botId');
+
+        if (!tx || tx.status !== 'accepted' || tx.operatorId !== emp.telegramId) {
+            return res.json({ success: false, message: 'الطلب غير متاح للإنهاء' });
+        }
+
+        if (emp.botId.parentBotId) { await ExecutorBot.findByIdAndUpdate(emp.botId.parentBotId, { $inc: { balance: -tx.amount } }); }
+        await ExecutorBot.findByIdAndUpdate(emp.botId._id, { $inc: { balance: -tx.amount } });
+
+        const buffer = Buffer.from(imageBase64.replace(/^data:image\/\w+;base64,/, ""), 'base64');
+        const adminAPI = new Telegram(process.env.ADMIN_BOT_TOKEN);
         
-        const { imageBase64 } = req.body;
-        if (!imageBase64) return sendError(res, 400, 'MISSING_DATA', 'صورة الإثبات مطلوبة بصيغة Base64.');
+        let typeLabel = tx.transferType === 'post_account' ? 'حساب بريد' : (tx.transferType === 'post_card' ? 'بطاقة عميل' : 'فودافون كاش');
+        let senderPhoneDisplay = senderPhone ? `\n📞 <b>رقم المُرسل:</b> <code>${senderPhone}</code>` : '';
+        const adminMsgCaption = `✅ <b>تم تنفيذ طلب تحويل (${typeLabel}) بنجاح!</b>\n\n🧾 <b>رقم الطلب:</b> <code>${tx.customId}</code>\n📞 <b>الرقم/الحساب:</b> <code>${tx.vodafoneNumber}</code>\n💵 <b>المبلغ:</b> ${tx.amount} EGP\n👨‍💻 <b>المنفذ:</b> ${emp.name}${senderPhoneDisplay}`;
 
-        const tx = await Transaction.findOne({ _id: req.params.id, operatorId: req.user.telegramId, status: 'accepted' });
-        if (!tx) return sendError(res, 400, 'INVALID_STATE', 'الطلب غير متاح للإنهاء.');
+        let savedFileId = null;
+        const admins = await Admin.find({});
+        for (const admin of admins) {
+            if (admin.telegramId && !admin.webUsername) {
+                try {
+                    let sentMsg;
+                    if (!savedFileId) {
+                        sentMsg = await adminAPI.sendPhoto(admin.telegramId, { source: buffer }, { caption: adminMsgCaption, parse_mode: 'HTML' });
+                        savedFileId = sentMsg.photo[sentMsg.photo.length - 1].file_id;
+                    } else { await adminAPI.sendPhoto(admin.telegramId, savedFileId, { caption: adminMsgCaption, parse_mode: 'HTML' }); }
+                } catch(e) {}
+            }
+        }
 
-        // 🟢 حماية السيرفر: الموبايل يرسل Base64 ويقوم السيرفر برفعه لتيليجرام للحصول على file_id لتخفيف الـ DB
-        const imageBuffer = Buffer.from(imageBase64.replace(/^data:image\/\w+;base64,/, ""), 'base64');
-        const execBot = await ExecutorBot.findById(req.user.botId);
-        const botAPI = new Telegram(execBot.token);
-        
-        const sentMsg = await botAPI.sendPhoto(req.user.telegramId, { source: imageBuffer }, { caption: `✅ تم التنفيذ عبر الموبايل\nالطلب: ${tx.customId}` });
-        const fileId = sentMsg.photo[sentMsg.photo.length - 1].file_id;
-
-        tx.status = 'completed';
-        tx.proofImage = fileId;
-        tx.proofImages = [fileId];
+        tx.status = 'completed'; 
+        tx.proofImage = savedFileId; 
+        if (senderPhone) tx.senderPhone = senderPhone;
+        tx.updatedAt = new Date();
         await tx.save();
 
-        // 🟢 إرسال الإشعار للعميل عبر تيليجرام كالمعتاد (في الخلفية)
-        setImmediate(async () => {
-            try {
-                let clientAPI = new Telegram(tx.clientBotId ? (await ClientBot.findById(tx.clientBotId)).token : process.env.CLIENT_BOT_TOKEN);
-                const msg = `✅ <b>تـم تـنـفـيـذ طـلـبـك بـنـجـاح!</b>\n🧾 الطلب: <code>${tx.customId}</code>\n💵 المبلغ: ${tx.amount} EGP`;
-                if (tx.userId) await clientAPI.sendPhoto(tx.userId, fileId, { caption: msg, parse_mode: 'HTML' }).catch(()=>{});
-            } catch(e) {}
-        });
-
-        return sendSuccess(res, { message: 'تم إكمال الطلب بنجاح.' });
-    } catch (e) {
-        return sendError(res, 500, 'SERVER_ERROR', 'حدث خطأ أثناء الرفع.');
-    }
+        res.json({ success: true, message: 'تم إرسال الإثبات بنجاح' });
+    } catch (e) { res.status(500).json({ success: false, message: 'خطأ في السيرفر' }); }
 });
 
-// ==========================================
-// 🖼️ الصور الآمنة (Image Proxy)
-// ==========================================
-router.get('/transaction/image/:id', requireMobileAuth, async (req, res) => {
+// =======================================================
+// 5️⃣ 🛡️ جلب إثباتات العمليات وحماية الصلاحيات لتطبيق الموبايل
+// =======================================================
+router.get('/transaction/image/:id', authenticateJWT, async (req, res) => {
     try {
+        const { userId, accountType, executorBotId, telegramId } = req.user;
         const tx = await Transaction.findById(req.params.id);
-        if (!tx || !tx.proofImage) return res.status(404).send('No image');
+        if (!tx) return res.status(404).json({ success: false, message: 'العملية غير موجودة' });
 
-        let token = process.env.ADMIN_BOT_TOKEN; // افتراضي نجلبها من توكن الإدارة
-        const api = new Telegram(token);
-        const fileLink = await api.getFileLink(tx.proofImage);
+        let hasAccess = false;
+        if (accountType === 'executor') {
+            if (tx.executorBotId && tx.executorBotId.toString() === executorBotId) hasAccess = true;
+            if (tx.managerBotId && tx.managerBotId.toString() === executorBotId) hasAccess = true;
+        } else if (accountType === 'client_company') {
+            const emp = await ClientEmployee.findById(userId);
+            if (emp && tx.clientBotId && tx.clientBotId.toString() === emp.clientBotId.toString()) hasAccess = true;
+        } else if (accountType === 'client_user') {
+            if (tx.userId === telegramId) hasAccess = true;
+        }
 
-        const response = await axios.get(fileLink.href, { responseType: 'stream' });
-        res.set('Content-Type', response.headers['content-type']);
-        response.data.pipe(res);
-    } catch (error) {
-        res.status(500).send('Error loading image');
-    }
+        if (!hasAccess) return res.status(403).json({ success: false, message: 'غير مصرح لك بعرض هذا المرفق' });
+
+        let photoId = tx.proofImages && tx.proofImages.length > 0 ? tx.proofImages[0] : tx.proofImage;
+        if (!photoId) return res.status(404).json({ success: false, message: 'لا توجد صورة إثبات' });
+
+        let fileLink = null;
+        let tokensToTry = [process.env.ADMIN_BOT_TOKEN, process.env.CLIENT_BOT_TOKEN];
+        if (tx.executorBotId) { const execBot = await ExecutorBot.findById(tx.executorBotId); if (execBot && execBot.token) tokensToTry.push(execBot.token); }
+        if (tx.clientBotId) { const clientBot = await ClientBot.findById(tx.clientBotId); if (clientBot && clientBot.token) tokensToTry.push(clientBot.token); }
+
+        for (const token of tokensToTry) {
+            if (!token) continue;
+            try { const api = new Telegram(token); fileLink = await api.getFileLink(photoId); if (fileLink) break; } catch(e) {}
+        }
+
+        if (!fileLink) return res.status(404).json({ success: false, message: 'لا يمكن جلب الصورة، ربما انتهت صلاحيتها' });
+        res.json({ success: true, url: fileLink.href });
+
+    } catch (e) { res.status(500).json({ success: false, message: 'خطأ داخلي في الخادم' }); }
 });
 
 module.exports = router;

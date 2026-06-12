@@ -6,8 +6,7 @@ const ClientEmployee = require('../../../models/ClientEmployee');
 const Transaction = require('../../../models/Transaction');
 const Settings = require('../../../models/Settings');
 const Admin = require('../../../models/Admin');
-const Counter = require('../../../models/Counter');
-const { updateClientTracking } = require('../../../services/clientTrackingService');
+const Counter = require('../../../models/Counter'); // 🟢 إضافة العداد الذكي
 
 const adminBotAPI = new Telegram(process.env.ADMIN_BOT_TOKEN);
 
@@ -27,9 +26,12 @@ const editPrompt = async (ctx, text, markup) => {
 
 const transferWizard = new Scenes.WizardScene(
     'TRANSFER_SCENE',
+    
+    // 1️⃣ الخطوة الأولى: التحقق من الشروط وطلب رقم الهاتف
     async (ctx) => {
         ctx.wizard.state.botData = ctx.scene.state.botData;
         ctx.wizard.state.isMainBot = ctx.scene.state.isMainBot;
+        
         ctx.wizard.state.phoneAttempts = 0;
         ctx.wizard.state.amountAttempts = 0;
 
@@ -37,20 +39,26 @@ const transferWizard = new Scenes.WizardScene(
             const set = await Settings.findOne({}) || await Settings.create({});
             const now = new Date();
             const currentTime = `${now.getHours().toString().padStart(2, '0')}:${now.getMinutes().toString().padStart(2, '0')}`;
+            
             if (set.isManualClosed || currentTime < set.openingTime || currentTime > set.closingTime) {
                 await ctx.reply(`⚠️ <b>نعتذر منك:</b>\n\n${set.closedMessage}`, { parse_mode: 'HTML' });
                 return ctx.scene.leave();
             }
+
             const termsMsg = set.termsMessage || '1. يرجى التأكد من الرقم قبل الإرسال.\n2. التحويل يتم خلال دقائق.';
             await ctx.reply(`⚠️ <b>شروط وقواعد التحويل:</b>\n\n${termsMsg}`, { parse_mode: 'HTML' });
         } catch (error) {}
 
         const text = '📞 <b>تحويل إلى مصر</b>\n\nالرجاء إرسال رقم المحفظة في مصر (11 رقم):';
         const markup = Markup.inlineKeyboard([[Markup.button.callback('❌ إلغاء العملية', 'cancel_transfer')]]);
+        
         const sent = await ctx.reply(text, { parse_mode: 'HTML', ...markup });
         ctx.wizard.state.promptMsgId = sent.message_id;
+
         return ctx.wizard.next();
     },
+
+    // 2️⃣ الخطوة الثانية: استقبال رقم الهاتف والتحقق منه
     async (ctx) => {
         if (ctx.callbackQuery) {
             await ctx.answerCbQuery().catch(() => {});
@@ -59,13 +67,16 @@ const transferWizard = new Scenes.WizardScene(
                 return ctx.scene.leave();
             }
         }
+
         if (ctx.message) {
             await ctx.deleteMessage().catch(()=>{}); 
+            
             const number = ctx.message.text?.trim();
             const isValidPhone = number && /^01[0125]\d{8}$/.test(number);
 
             if (!isValidPhone) {
                 ctx.wizard.state.phoneAttempts += 1; 
+                
                 if (ctx.wizard.state.phoneAttempts >= 2) {
                     await editPrompt(ctx, '❌ لقد قمت بإدخال رقم هاتف غير صحيح مرتين متتاليتين.\nتم إلغاء العملية لحماية النظام، يمكنك المحاولة من جديد لاحقاً من القائمة الرئيسية.', Markup.inlineKeyboard([]));
                     return ctx.scene.leave(); 
@@ -77,6 +88,7 @@ const transferWizard = new Scenes.WizardScene(
 
             ctx.wizard.state.phoneAttempts = 0; 
             ctx.wizard.state.vodafoneNumber = number;
+            
             await editPrompt(ctx, `✅ تم حفظ الرقم: <code>${number}</code>\n\n💸 الرجاء إرسال المبلغ المراد تحويله (بالجنيه المصري):`, Markup.inlineKeyboard([
                 [Markup.button.callback('🔙 تعديل الرقم', 'back_to_step_1')],
                 [Markup.button.callback('❌ إلغاء العملية', 'cancel_transfer')]
@@ -84,6 +96,8 @@ const transferWizard = new Scenes.WizardScene(
             return ctx.wizard.next();
         }
     },
+
+    // 3️⃣ الخطوة الثالثة: استقبال المبلغ والتحقق المبدئي منه
     async (ctx) => {
         if (ctx.callbackQuery) {
             await ctx.answerCbQuery().catch(() => {});
@@ -98,12 +112,15 @@ const transferWizard = new Scenes.WizardScene(
                 return;
             }
         }
+
         if (ctx.message) {
             await ctx.deleteMessage().catch(()=>{}); 
+            
             const amountEGP = parseFloat(ctx.message.text?.trim());
             
             if (isNaN(amountEGP) || amountEGP <= 0) {
                 ctx.wizard.state.amountAttempts += 1; 
+                
                 if (ctx.wizard.state.amountAttempts >= 2) {
                     await editPrompt(ctx, '❌ لقد قمت بإدخال مبلغ غير صالح مرتين متتاليتين.\nتم إلغاء العملية لحماية النظام.', Markup.inlineKeyboard([]));
                     return ctx.scene.leave(); 
@@ -114,6 +131,7 @@ const transferWizard = new Scenes.WizardScene(
             }
 
             ctx.wizard.state.amountAttempts = 0; 
+
             let clientTier = 1;
             let safeBalance = 0;
             let safeCreditLimit = 0;
@@ -159,7 +177,7 @@ const transferWizard = new Scenes.WizardScene(
 
             await editPrompt(ctx, 
                 `📝 <b>إضافة ملاحظة (اختياري):</b>\n\n` +
-                `هل تود إضافة ملاحظة مع هذه الحوالة؟\n` +
+                `هل تود إضافة ملاحظة مع هذه الحوالة؟ (مثال: اسم صاحب المحفظة أو سبب التحويل)\n` +
                 `👉 <b>أرسل الملاحظة الآن في رسالة، أو اضغط "تخطي".</b>`,
                 Markup.inlineKeyboard([
                     [Markup.button.callback('⏭️ تخطي (بدون ملاحظة)', 'skip_note')],
@@ -170,6 +188,8 @@ const transferWizard = new Scenes.WizardScene(
             return ctx.wizard.next();
         }
     },
+
+    // 4️⃣ الخطوة الرابعة: استقبال الملاحظة ومراجعة الطلب
     async (ctx) => {
         let action = ctx.callbackQuery?.data;
         let note = null;
@@ -189,7 +209,9 @@ const transferWizard = new Scenes.WizardScene(
                 ctx.wizard.selectStep(2);
                 return;
             }
-            if (action === 'skip_note') { note = null; }
+            if (action === 'skip_note') {
+                note = null;
+            }
         } else if (ctx.message) {
             await ctx.deleteMessage().catch(()=>{});
             note = ctx.message.text?.trim();
@@ -199,6 +221,7 @@ const transferWizard = new Scenes.WizardScene(
 
         ctx.wizard.state.transferNote = note;
         const { vodafoneNumber, amountEGP, amountLYD, exchangeRate } = ctx.wizard.state;
+        
         const noteDisplay = note ? `\n📝 <b>الملاحظة:</b> ${note}` : '\n📝 <b>الملاحظة:</b> <i>لا توجد</i>';
 
         await editPrompt(ctx, 
@@ -217,6 +240,8 @@ const transferWizard = new Scenes.WizardScene(
         );
         return ctx.wizard.next();
     },
+
+    // 5️⃣ الخطوة الخامسة: تأكيد الإرسال (محمي بالخصم الذري 🛡️)
     async (ctx) => {
         if (!ctx.callbackQuery) {
             if (ctx.message) await ctx.deleteMessage().catch(()=>{});
@@ -245,7 +270,7 @@ const transferWizard = new Scenes.WizardScene(
         }
 
         if (action === 'confirm_transfer') {
-            await ctx.answerCbQuery('⏳ جاري إرسال الطلب...').catch(()=>{});
+            await ctx.answerCbQuery('⏳ جاري معالجة الطلب...').catch(()=>{});
 
             const telegramId = ctx.from.id.toString();
             const { isMainBot, botData, amountEGP, amountLYD, exchangeRate, vodafoneNumber, transferNote } = ctx.wizard.state;
@@ -253,6 +278,7 @@ const transferWizard = new Scenes.WizardScene(
             const filter = isMainBot ? { userId: telegramId, clientBotId: null } : { clientBotId: botData._id };
             filter.vodafoneNumber = vodafoneNumber;
 
+            // 🛡️ الحماية ضد الحوالات المكررة (Spam Protection)
             const lastTx = await Transaction.findOne(filter).sort({ createdAt: -1 });
             if (lastTx) {
                 const diffSeconds = (Date.now() - lastTx.createdAt.getTime()) / 1000;
@@ -273,14 +299,16 @@ const transferWizard = new Scenes.WizardScene(
             let employeeName = ctx.from.first_name;
 
             try {
+                // جلب البيانات الأساسية واسم الموظف
                 let accountDoc = await TargetModel.findOne(targetFilter);
                 if (!accountDoc) {
                     await editPrompt(ctx, '❌ الحساب غير موجود.', {});
                     return ctx.scene.leave();
                 }
 
-                if (isMainBot) { employeeName = accountDoc.name; } 
-                else {
+                if (isMainBot) {
+                    employeeName = accountDoc.name;
+                } else {
                     const emp = await ClientEmployee.findOne({ telegramId, clientBotId: botData._id });
                     if (emp) employeeName = emp.name;
                 }
@@ -288,6 +316,7 @@ const transferWizard = new Scenes.WizardScene(
                 const creditLimit = accountDoc.creditLimit || 0;
                 const minRequiredBalance = requiredLYD - creditLimit;
 
+                // 🛡️ الخصم الذري لحماية الرصيد ومنع السحب المزدوج نهائياً
                 const updatedAccount = await TargetModel.findOneAndUpdate(
                     { ...targetFilter, balance: { $gte: minRequiredBalance } },
                     { $inc: { balance: -requiredLYD } },
@@ -295,16 +324,20 @@ const transferWizard = new Scenes.WizardScene(
                 );
 
                 if (!updatedAccount) {
-                    await editPrompt(ctx, '❌ <b>فشلت العملية!</b> الرصيد غير كافٍ.', {});
+                    await editPrompt(ctx, '❌ <b>فشلت العملية!</b> الرصيد غير كافٍ أو هناك عملية أخرى قيد التنفيذ استهلكت رصيدك.', {});
                     return ctx.scene.leave();
                 }
 
-                const counter = await Counter.findOneAndUpdate({ name: 'transaction' }, { $inc: { value: 1 } }, { upsert: true, new: true });
+                // 🟢 توليد رقم تسلسلي فريد وغير قابل للتكرار باستخدام Counter
+                const counter = await Counter.findOneAndUpdate(
+                    { name: 'transaction' }, { $inc: { value: 1 } }, { upsert: true, new: true }
+                );
                 const yy = new Date().getFullYear().toString().slice(-2);
                 const mm = (new Date().getMonth() + 1).toString().padStart(2, '0');
                 const customOrderId = `ATT-${yy}${mm}-${counter.value.toString().padStart(4, '0')}`;
 
-                const newTx = await Transaction.create({
+                // حفظ العملية في قاعدة البيانات
+                const transaction = await Transaction.create({
                     userId: telegramId,
                     amount: amountEGP, 
                     costLYD: requiredLYD,
@@ -318,18 +351,26 @@ const transferWizard = new Scenes.WizardScene(
                     employeeName: employeeName
                 });
 
-                // 🟢 استدعاء المحرك ليرسل رسالة التتبع الجديدة!
-                await ctx.deleteMessage(ctx.wizard.state.promptMsgId).catch(()=>{});
-                await ctx.reply(`✅ <b>تم تقديم الطلب بنجاح!</b>\nيرجى متابعة سجل الحوالة بالأسفل 👇`, { parse_mode: 'HTML' });
-                
-                await updateClientTracking(newTx._id, 'sent_to_admin');
+                const clientNoteDisplay = transferNote ? `📝 <b>الملاحظة:</b> ${transferNote}\n` : '';
 
+                await editPrompt(ctx, 
+                    `✅ <b>تم إرسال طلبك بنجاح!</b>\n\n` +
+                    `🧾 <b>رقم الطلب:</b> <code>${transaction.customId}</code>\n` +
+                    `📞 <b>الرقم:</b> <code>${vodafoneNumber}</code>\n` +
+                    `🇪🇬 <b>المبلغ:</b> ${amountEGP} جنيه\n` +
+                    `💰 <b>تم خصم:</b> ${requiredLYD.toFixed(2)} دينار\n` +
+                    `${clientNoteDisplay}\n` +
+                    `⏳ الطلب الآن "قيد التنفيذ".`,
+                    {} 
+                );
+
+                // إشعار باقي موظفي الشركة (إن وجدت)
                 if (!isMainBot) {
                     try {
                         const companyBotAPI = new Telegram(botData.token);
                         const colleagues = await ClientEmployee.find({ clientBotId: botData._id, status: 'active', telegramId: { $ne: telegramId } });
                         if (colleagues.length > 0) {
-                            const broadcastMsg = `📢 <b>إشعار للشركة: تم إرسال طلب جديد</b>\n\n👨‍💻 <b>بواسطة الموظف:</b> ${employeeName}\n━━━━━━━━━━━━━━\n🧾 <b>رقم الطلب:</b> <code>${newTx.customId}</code>\n📞 <b>الرقم المحول إليه:</b> <code>${vodafoneNumber}</code>\n🇪🇬 <b>المبلغ:</b> ${amountEGP} جنيه\n💰 <b>تم خصم:</b> ${requiredLYD.toFixed(2)} دينار`;
+                            const broadcastMsg = `📢 <b>إشعار للشركة: تم إرسال طلب جديد</b>\n\n👨‍💻 <b>بواسطة الموظف:</b> ${employeeName}\n━━━━━━━━━━━━━━\n🧾 <b>رقم الطلب:</b> <code>${transaction.customId}</code>\n📞 <b>الرقم المحول إليه:</b> <code>${vodafoneNumber}</code>\n🇪🇬 <b>المبلغ:</b> ${amountEGP} جنيه\n💰 <b>تم خصم:</b> ${requiredLYD.toFixed(2)} دينار\n${clientNoteDisplay}`;
                             for (const col of colleagues) {
                                 await companyBotAPI.sendMessage(col.telegramId, broadcastMsg, { parse_mode: 'HTML' }).catch(()=>{});
                             }
@@ -337,16 +378,17 @@ const transferWizard = new Scenes.WizardScene(
                     } catch(e) {}
                 }
 
+                // إرسال الإشعار للإدارة العليا مع أزرار التحكم
                 const sourceHeader = isMainBot ? `👤 <b>عميل فردي:</b> ${employeeName}` : `🏢 <b>الشركة:</b> ${botData.name}\n👨‍💻 <b>الموظف:</b> ${employeeName}`;
                 const adminNoteDisplay = transferNote ? `\n📝 <b>ملاحظة العميل:</b> <i>${transferNote}</i>` : '';
                 
-                const msgText = `🔔 <b>طلب تحويل فودافون كاش!</b>\n\n${sourceHeader}\n📞 <b>الرقم:</b> <code>${newTx.vodafoneNumber}</code>\n🇪🇬 <b>المبلغ المطلوب:</b> ${newTx.amount} EGP\n🇱🇾 <b>الدفع:</b> ${newTx.costLYD.toFixed(2)} LYD (سعر: ${exchangeRate})\n🧾 <b>رقم الطلب:</b> <code>${newTx.customId}</code>${adminNoteDisplay}`; 
+                const msgText = `🔔 <b>طلب تحويل فودافون كاش!</b>\n\n${sourceHeader}\n📞 <b>الرقم:</b> <code>${transaction.vodafoneNumber}</code>\n🇪🇬 <b>المبلغ المطلوب:</b> ${transaction.amount} EGP\n🇱🇾 <b>الدفع:</b> ${transaction.costLYD.toFixed(2)} LYD (سعر: ${exchangeRate})\n🧾 <b>رقم الطلب:</b> <code>${transaction.customId}</code>${adminNoteDisplay}`; 
                 
                 const msgMarkup = {
                     parse_mode: 'HTML',
                     ...Markup.inlineKeyboard([
-                        [Markup.button.callback('🤖 تحويل لبوت تنفيذي', `forward_${newTx._id}`)],
-                        [Markup.button.callback('❌ إلغاء العملية', `cancelReq_${newTx._id}`)]
+                        [Markup.button.callback('🤖 تحويل لبوت تنفيذي', `forward_${transaction._id}`)],
+                        [Markup.button.callback('❌ إلغاء العملية', `cancelReq_${transaction._id}`)]
                     ])
                 };
 
@@ -362,8 +404,8 @@ const transferWizard = new Scenes.WizardScene(
                 }
                 
                 if (savedAdminMsgs.length > 0) {
-                    newTx.adminMessages = savedAdminMsgs;
-                    await newTx.save();
+                    transaction.adminMessages = savedAdminMsgs;
+                    await transaction.save();
                 }
                     
             } catch (error) {

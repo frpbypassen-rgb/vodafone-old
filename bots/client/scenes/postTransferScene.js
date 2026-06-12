@@ -1,15 +1,12 @@
-// bots/client/scenes/transferScene.js
-const { Scenes, Telegram, Markup } = require('telegraf');
-const User = require('../../../models/User');
-const ClientBot = require('../../../models/ClientBot');
-const ClientEmployee = require('../../../models/ClientEmployee');
-const Transaction = require('../../../models/Transaction');
+// bots/client/scenes/postTransferScene.js
+const { Scenes, Markup, Telegram } = require('telegraf');
 const Settings = require('../../../models/Settings');
+const User = require('../../../models/User');
+const ClientEmployee = require('../../../models/ClientEmployee');
+const ClientBot = require('../../../models/ClientBot');
+const Transaction = require('../../../models/Transaction');
 const Admin = require('../../../models/Admin');
-const Counter = require('../../../models/Counter');
-const { updateClientTracking } = require('../../../services/clientTrackingService');
-
-const adminBotAPI = new Telegram(process.env.ADMIN_BOT_TOKEN);
+const Counter = require('../../../models/Counter'); // 🟢 إضافة العداد الذكي
 
 const editPrompt = async (ctx, text, markup) => {
     try {
@@ -25,354 +22,344 @@ const editPrompt = async (ctx, text, markup) => {
     }
 };
 
-const transferWizard = new Scenes.WizardScene(
-    'TRANSFER_SCENE',
+const postTransferWizard = new Scenes.WizardScene(
+    'POST_TRANSFER_SCENE',
+    
+    // الخطوة 1: تحديد النوع
     async (ctx) => {
-        ctx.wizard.state.botData = ctx.scene.state.botData;
         ctx.wizard.state.isMainBot = ctx.scene.state.isMainBot;
-        ctx.wizard.state.phoneAttempts = 0;
-        ctx.wizard.state.amountAttempts = 0;
+        ctx.wizard.state.botData = ctx.scene.state.botData;
+        
+        const text = '📮 <b>تحديد نوع تحويل البريد:</b>\n\nيرجى اختيار الطريقة التي تريد التحويل بها:';
+        const markup = Markup.inlineKeyboard([
+            [Markup.button.callback('📥 تحويل إلى حساب بريد', 'post_account')],
+            [Markup.button.callback('💳 تحويل إلى بطاقة عميل', 'post_card')],
+            [Markup.button.callback('❌ إلغاء العملية', 'cancel_tx')]
+        ]);
 
-        try {
-            const set = await Settings.findOne({}) || await Settings.create({});
-            const now = new Date();
-            const currentTime = `${now.getHours().toString().padStart(2, '0')}:${now.getMinutes().toString().padStart(2, '0')}`;
-            if (set.isManualClosed || currentTime < set.openingTime || currentTime > set.closingTime) {
-                await ctx.reply(`⚠️ <b>نعتذر منك:</b>\n\n${set.closedMessage}`, { parse_mode: 'HTML' });
-                return ctx.scene.leave();
-            }
-            const termsMsg = set.termsMessage || '1. يرجى التأكد من الرقم قبل الإرسال.\n2. التحويل يتم خلال دقائق.';
-            await ctx.reply(`⚠️ <b>شروط وقواعد التحويل:</b>\n\n${termsMsg}`, { parse_mode: 'HTML' });
-        } catch (error) {}
-
-        const text = '📞 <b>تحويل إلى مصر</b>\n\nالرجاء إرسال رقم المحفظة في مصر (11 رقم):';
-        const markup = Markup.inlineKeyboard([[Markup.button.callback('❌ إلغاء العملية', 'cancel_transfer')]]);
         const sent = await ctx.reply(text, { parse_mode: 'HTML', ...markup });
         ctx.wizard.state.promptMsgId = sent.message_id;
+        
         return ctx.wizard.next();
     },
-    async (ctx) => {
-        if (ctx.callbackQuery) {
-            await ctx.answerCbQuery().catch(() => {});
-            if (ctx.callbackQuery.data === 'cancel_transfer') {
-                await editPrompt(ctx, '❌ تم إلغاء العملية والعودة للقائمة الرئيسية.', {});
-                return ctx.scene.leave();
-            }
-        }
-        if (ctx.message) {
-            await ctx.deleteMessage().catch(()=>{}); 
-            const number = ctx.message.text?.trim();
-            const isValidPhone = number && /^01[0125]\d{8}$/.test(number);
 
-            if (!isValidPhone) {
-                ctx.wizard.state.phoneAttempts += 1; 
-                if (ctx.wizard.state.phoneAttempts >= 2) {
-                    await editPrompt(ctx, '❌ لقد قمت بإدخال رقم هاتف غير صحيح مرتين متتاليتين.\nتم إلغاء العملية لحماية النظام، يمكنك المحاولة من جديد لاحقاً من القائمة الرئيسية.', Markup.inlineKeyboard([]));
-                    return ctx.scene.leave(); 
-                } else {
-                    await editPrompt(ctx, '⚠️ <b>رقم الهاتف المدخل غير صحيح!</b>\nيرجى التأكد من كتابة 11 رقماً ويبدأ بـ 01 <b>(تتبقى لك محاولة واحدة)</b>:', Markup.inlineKeyboard([[Markup.button.callback('❌ إلغاء العملية', 'cancel_transfer')]]));
-                    return; 
-                }
-            }
-
-            ctx.wizard.state.phoneAttempts = 0; 
-            ctx.wizard.state.vodafoneNumber = number;
-            await editPrompt(ctx, `✅ تم حفظ الرقم: <code>${number}</code>\n\n💸 الرجاء إرسال المبلغ المراد تحويله (بالجنيه المصري):`, Markup.inlineKeyboard([
-                [Markup.button.callback('🔙 تعديل الرقم', 'back_to_step_1')],
-                [Markup.button.callback('❌ إلغاء العملية', 'cancel_transfer')]
-            ]));
-            return ctx.wizard.next();
-        }
-    },
-    async (ctx) => {
-        if (ctx.callbackQuery) {
-            await ctx.answerCbQuery().catch(() => {});
-            if (ctx.callbackQuery.data === 'cancel_transfer') {
-                await editPrompt(ctx, '❌ تم إلغاء العملية.', {});
-                return ctx.scene.leave();
-            }
-            if (ctx.callbackQuery.data === 'back_to_step_1') {
-                ctx.wizard.state.phoneAttempts = 0; 
-                await editPrompt(ctx, '📞 <b>تحويل إلى مصر</b>\n\nالرجاء إرسال رقم المحفظة في مصر (11 رقم):', Markup.inlineKeyboard([[Markup.button.callback('❌ إلغاء العملية', 'cancel_transfer')]]));
-                ctx.wizard.selectStep(1);
-                return;
-            }
-        }
-        if (ctx.message) {
-            await ctx.deleteMessage().catch(()=>{}); 
-            const amountEGP = parseFloat(ctx.message.text?.trim());
-            
-            if (isNaN(amountEGP) || amountEGP <= 0) {
-                ctx.wizard.state.amountAttempts += 1; 
-                if (ctx.wizard.state.amountAttempts >= 2) {
-                    await editPrompt(ctx, '❌ لقد قمت بإدخال مبلغ غير صالح مرتين متتاليتين.\nتم إلغاء العملية لحماية النظام.', Markup.inlineKeyboard([]));
-                    return ctx.scene.leave(); 
-                } else {
-                    await editPrompt(ctx, '⚠️ <b>مبلغ غير صالح!</b>\nأدخل رقماً صحيحاً أكبر من الصفر <b>(تتبقى لك محاولة واحدة)</b>:', Markup.inlineKeyboard([[Markup.button.callback('🔙 عودة', 'back_to_step_1')]]));
-                    return; 
-                }
-            }
-
-            ctx.wizard.state.amountAttempts = 0; 
-            let clientTier = 1;
-            let safeBalance = 0;
-            let safeCreditLimit = 0;
-
-            if (ctx.wizard.state.isMainBot) {
-                const user = await User.findOne({ telegramId: ctx.from.id.toString() });
-                if (user) {
-                    clientTier = user.tier || 1;
-                    safeBalance = parseFloat(user.balance) || 0;
-                    safeCreditLimit = Math.abs(parseFloat(user.creditLimit) || 0);
-                }
-            } else {
-                const company = await ClientBot.findById(ctx.wizard.state.botData._id);
-                if (company) {
-                    clientTier = company.tier || 1;
-                    safeBalance = parseFloat(company.balance) || 0;
-                    safeCreditLimit = Math.abs(parseFloat(company.creditLimit) || 0);
-                }
-            }
-
-            const availableFunds = safeBalance + safeCreditLimit;
-            const set = await Settings.findOne({}) || await Settings.create({});
-            let currentExchangeRate = set.rateLevel1 || 6.40;
-            if (clientTier === 2) currentExchangeRate = set.rateLevel2 || 6.45;
-            if (clientTier === 3) currentExchangeRate = set.rateLevel3 || 6.50;
-            
-            const amountLYD = parseFloat((amountEGP / currentExchangeRate).toFixed(3));
-            
-            if (amountLYD > availableFunds) {
-                await editPrompt(ctx, 
-                    `❌ <b>عذراً، لا يمكن تنفيذ العملية لتجاوز الحد الأقصى للمديونية!</b>\n\n` +
-                    `💰 <b>المتاح كلياً:</b> ${availableFunds.toFixed(2)} دينار\n` +
-                    `📉 <b>تكلفة الحوالة:</b> ${amountLYD.toFixed(2)} دينار\n\n` +
-                    `يرجى تسديد المديونية للمتابعة.`,
-                    Markup.inlineKeyboard([[Markup.button.callback('🔙 تعديل المبلغ', 'back_to_step_1')]])
-                );
-                return; 
-            }
-
-            ctx.wizard.state.amountEGP = amountEGP;
-            ctx.wizard.state.amountLYD = amountLYD;
-            ctx.wizard.state.exchangeRate = currentExchangeRate;
-
-            await editPrompt(ctx, 
-                `📝 <b>إضافة ملاحظة (اختياري):</b>\n\n` +
-                `هل تود إضافة ملاحظة مع هذه الحوالة؟\n` +
-                `👉 <b>أرسل الملاحظة الآن في رسالة، أو اضغط "تخطي".</b>`,
-                Markup.inlineKeyboard([
-                    [Markup.button.callback('⏭️ تخطي (بدون ملاحظة)', 'skip_note')],
-                    [Markup.button.callback('🔙 تعديل المبلغ', 'back_to_step_2')],
-                    [Markup.button.callback('❌ إلغاء العملية', 'cancel_transfer')]
-                ])
-            );
-            return ctx.wizard.next();
-        }
-    },
-    async (ctx) => {
-        let action = ctx.callbackQuery?.data;
-        let note = null;
-
-        if (ctx.callbackQuery) {
-            await ctx.answerCbQuery().catch(()=>{});
-            if (action === 'cancel_transfer') {
-                await editPrompt(ctx, '❌ تم إلغاء العملية بنجاح.', {});
-                return ctx.scene.leave();
-            }
-            if (action === 'back_to_step_2') {
-                ctx.wizard.state.amountAttempts = 0; 
-                await editPrompt(ctx, `✅ تم حفظ الرقم: <code>${ctx.wizard.state.vodafoneNumber}</code>\n\n💸 الرجاء إرسال المبلغ المراد تحويله (بالجنيه المصري):`, Markup.inlineKeyboard([
-                    [Markup.button.callback('🔙 تعديل الرقم', 'back_to_step_1')],
-                    [Markup.button.callback('❌ إلغاء العملية', 'cancel_transfer')]
-                ]));
-                ctx.wizard.selectStep(2);
-                return;
-            }
-            if (action === 'skip_note') { note = null; }
-        } else if (ctx.message) {
-            await ctx.deleteMessage().catch(()=>{});
-            note = ctx.message.text?.trim();
-        }
-
-        if (note === undefined) return; 
-
-        ctx.wizard.state.transferNote = note;
-        const { vodafoneNumber, amountEGP, amountLYD, exchangeRate } = ctx.wizard.state;
-        const noteDisplay = note ? `\n📝 <b>الملاحظة:</b> ${note}` : '\n📝 <b>الملاحظة:</b> <i>لا توجد</i>';
-
-        await editPrompt(ctx, 
-            `📊 <b>مراجعة وتأكيد الطلب:</b>\n\n` +
-            `📞 <b>الرقم المحول إليه:</b> <code>${vodafoneNumber}</code>\n` +
-            `🇪🇬 <b>المبلغ المطلوب:</b> ${amountEGP} جنيه\n` +
-            `🇱🇾 <b>التكلفة:</b> ${amountLYD.toFixed(2)} دينار\n` +
-            `💱 <b>سعر الصرف:</b> 1 دينار = ${exchangeRate} جنيه` +
-            `${noteDisplay}\n\n` +
-            `هل تريد تأكيد العملية وإرسال التحويل؟`,
-            Markup.inlineKeyboard([
-                [Markup.button.callback('✅ إرسال التحويل', 'confirm_transfer')],
-                [Markup.button.callback('🔙 تعديل الملاحظة', 'back_to_note')],
-                [Markup.button.callback('❌ إلغاء العملية', 'cancel_transfer')]
-            ])
-        );
-        return ctx.wizard.next();
-    },
+    // الخطوة 2: استقبال اختيار النوع
     async (ctx) => {
         if (!ctx.callbackQuery) {
             if (ctx.message) await ctx.deleteMessage().catch(()=>{});
             return;
         }
-        
-        const action = ctx.callbackQuery.data;
+        await ctx.answerCbQuery().catch(()=>{});
 
-        if (action === 'cancel_transfer') {
-            await ctx.answerCbQuery().catch(()=>{});
-            await editPrompt(ctx, '❌ تم إلغاء عملية التحويل بنجاح.', {});
+        const choice = ctx.callbackQuery.data;
+        if (choice === 'cancel_tx') {
+            await editPrompt(ctx, '✅ تم إلغاء عملية التحويل.', {});
             return ctx.scene.leave();
         }
 
-        if (action === 'back_to_note') {
-            await ctx.answerCbQuery().catch(()=>{});
-            await editPrompt(ctx, 
-                `📝 <b>إضافة ملاحظة (اختياري):</b>\n\nأرسل الملاحظة الآن في رسالة، أو اضغط "تخطي".`,
-                Markup.inlineKeyboard([
-                    [Markup.button.callback('⏭️ تخطي', 'skip_note')],
-                    [Markup.button.callback('🔙 تعديل المبلغ', 'back_to_step_2')]
-                ])
-            );
-            ctx.wizard.selectStep(3); 
+        ctx.wizard.state.transferType = choice;
+
+        if (choice === 'post_account') {
+            await editPrompt(ctx, '📝 <b>تحويل إلى حساب بريد:</b>\n\nالرجاء إدخال **رقم الحساب** المكون من (16 رقم):', Markup.inlineKeyboard([[Markup.button.callback('❌ إلغاء العملية', 'cancel_tx')]]));
+            ctx.wizard.state.step = 'awaiting_account_number';
+        } else if (choice === 'post_card') {
+            await editPrompt(ctx, '💳 <b>تحويل إلى بطاقة عميل:</b>\n\nالرجاء إدخال **الاسم رباعي** للمستلم:', Markup.inlineKeyboard([[Markup.button.callback('❌ إلغاء العملية', 'cancel_tx')]]));
+            ctx.wizard.state.step = 'awaiting_card_name';
+        }
+        return ctx.wizard.next();
+    },
+
+    // الخطوة 3: استقبال مدخلات العميل والتحقق منها
+    async (ctx) => {
+        if (ctx.callbackQuery) {
+            if (ctx.callbackQuery.data === 'cancel_tx') {
+                await ctx.answerCbQuery().catch(()=>{});
+                await editPrompt(ctx, '✅ تم الإلغاء.', {});
+                return ctx.scene.leave();
+            }
+        }
+
+        const text = ctx.message?.text;
+        if (ctx.message) await ctx.deleteMessage().catch(()=>{}); 
+        
+        if (!text && !ctx.message?.photo) {
+            await editPrompt(ctx, '⚠️ الرجاء إدخال بيانات صحيحة.', Markup.inlineKeyboard([[Markup.button.callback('❌ إلغاء العملية', 'cancel_tx')]]));
+            return;
+        }
+        
+        if (text === '/cancel' || text === '🏠 القائمة الرئيسية (ابدأ)') {
+            await editPrompt(ctx, '✅ تم الإلغاء.', {});
+            return ctx.scene.leave();
+        }
+
+        if (ctx.wizard.state.step === 'awaiting_account_number') {
+            if(!text || !/^\d{16}$/.test(text.trim())) {
+                return editPrompt(ctx, '⚠️ **رقم الحساب غير صحيح!**\nيجب أن يتكون رقم حساب البريد من **16 رقم بالتمام**.\n\nالرجاء إعادة الإدخال بشكل صحيح:', Markup.inlineKeyboard([[Markup.button.callback('❌ إلغاء العملية', 'cancel_tx')]]));
+            }
+            ctx.wizard.state.accountNumber = text.trim();
+            await editPrompt(ctx, `✅ الحساب: <code>${text.trim()}</code>\n\n👤 ممتاز، الآن الرجاء إدخال **اسم صاحب الحساب**:`, Markup.inlineKeyboard([[Markup.button.callback('❌ إلغاء العملية', 'cancel_tx')]]));
+            ctx.wizard.state.step = 'awaiting_account_name';
             return;
         }
 
-        if (action === 'confirm_transfer') {
-            await ctx.answerCbQuery('⏳ جاري إرسال الطلب...').catch(()=>{});
+        if (ctx.wizard.state.step === 'awaiting_account_name') {
+            if(!text) return editPrompt(ctx, '⚠️ الرجاء إرسال الاسم كنص.', Markup.inlineKeyboard([[Markup.button.callback('❌ إلغاء العملية', 'cancel_tx')]]));
+            ctx.wizard.state.accountName = text;
+            await editPrompt(ctx, `✅ الاسم: ${text}\n\n💵 أخيراً، الرجاء إدخال **المبلغ المراد تحويله (بالجنيه المصري)**:`, Markup.inlineKeyboard([[Markup.button.callback('❌ إلغاء العملية', 'cancel_tx')]]));
+            ctx.wizard.state.step = 'awaiting_amount';
+            return;
+        }
 
-            const telegramId = ctx.from.id.toString();
-            const { isMainBot, botData, amountEGP, amountLYD, exchangeRate, vodafoneNumber, transferNote } = ctx.wizard.state;
+        if (ctx.wizard.state.step === 'awaiting_card_name') {
+            const nameParts = text ? text.trim().split(/\s+/) : [];
+            if(nameParts.length < 4) {
+                return editPrompt(ctx, '⚠️ **الاسم غير مكتمل!**\nالرجاء إدخال **الاسم رباعي** (4 مقاطع على الأقل):\n\nمثال: <i>أحمد محمد علي محمود</i>', Markup.inlineKeyboard([[Markup.button.callback('❌ إلغاء العملية', 'cancel_tx')]]));
+            }
+            ctx.wizard.state.accountName = text.trim();
+            await editPrompt(ctx, `✅ الاسم: ${text.trim()}\n\n🔢 الرجاء إدخال **الرقم القومي** (14 رقم):`, Markup.inlineKeyboard([[Markup.button.callback('❌ إلغاء العملية', 'cancel_tx')]]));
+            ctx.wizard.state.step = 'awaiting_national_id';
+            return;
+        }
+
+        if (ctx.wizard.state.step === 'awaiting_national_id') {
+            if(!text || !/^\d{14}$/.test(text.trim())) {
+                return editPrompt(ctx, '⚠️ **الرقم القومي غير صحيح!**\nيجب أن يتكون الرقم القومي من **14 رقم بالتمام**.\n\nالرجاء إعادة إدخاله بشكل صحيح:', Markup.inlineKeyboard([[Markup.button.callback('❌ إلغاء العملية', 'cancel_tx')]]));
+            }
+            ctx.wizard.state.nationalId = text.trim();
+            await editPrompt(ctx, `✅ الرقم القومي: <code>${text.trim()}</code>\n\n📍 الرجاء إدخال **اسم المحافظة**:`, Markup.inlineKeyboard([[Markup.button.callback('❌ إلغاء العملية', 'cancel_tx')]]));
+            ctx.wizard.state.step = 'awaiting_governorate';
+            return;
+        }
+
+        if (ctx.wizard.state.step === 'awaiting_governorate') {
+            if(!text) return editPrompt(ctx, '⚠️ الرجاء إرسال اسم المحافظة كنص.', Markup.inlineKeyboard([[Markup.button.callback('❌ إلغاء العملية', 'cancel_tx')]]));
+            ctx.wizard.state.governorate = text.trim();
+            await editPrompt(ctx, `✅ المحافظة: ${text.trim()}\n\n📸 <b>الرجاء إرسال صورة واضحة لبطاقة العميل (وجه أو وجهين):</b>`, Markup.inlineKeyboard([[Markup.button.callback('❌ إلغاء العملية', 'cancel_tx')]]));
+            ctx.wizard.state.step = 'awaiting_card_image';
+            return;
+        }
+
+        if (ctx.wizard.state.step === 'awaiting_card_image') {
+            if (!ctx.message.photo) return editPrompt(ctx, '⚠️ الرجاء إرسال "صورة" البطاقة (وليس ملفاً أو نصاً).', Markup.inlineKeyboard([[Markup.button.callback('❌ إلغاء العملية', 'cancel_tx')]]));
+            ctx.wizard.state.idCardImage = ctx.message.photo[ctx.message.photo.length - 1].file_id;
+            await editPrompt(ctx, '✅ تم استلام صورة البطاقة!\n\n💵 الآن، الرجاء إدخال **المبلغ المراد تحويله (بالجنيه المصري)**:', Markup.inlineKeyboard([[Markup.button.callback('❌ إلغاء العملية', 'cancel_tx')]]));
+            ctx.wizard.state.step = 'awaiting_amount';
+            return;
+        }
+
+        // حساب المبالغ والفروق
+        if (ctx.wizard.state.step === 'awaiting_amount') {
+            if(!text) return editPrompt(ctx, '⚠️ الرجاء إدخال المبلغ بالأرقام.', Markup.inlineKeyboard([[Markup.button.callback('❌ إلغاء العملية', 'cancel_tx')]]));
+            const amount = parseFloat(text);
+            if (isNaN(amount) || amount <= 0) return editPrompt(ctx, '⚠️ الرجاء إدخال مبلغ صحيح بالأرقام الإنجليزية.', Markup.inlineKeyboard([[Markup.button.callback('❌ إلغاء العملية', 'cancel_tx')]]));
+
+            ctx.wizard.state.amount = amount;
             
-            const filter = isMainBot ? { userId: telegramId, clientBotId: null } : { clientBotId: botData._id };
-            filter.vodafoneNumber = vodafoneNumber;
+            const telegramId = ctx.from.id.toString();
+            let tier = 1, currentBalance = 0, creditLimit = 0;
+            const set = await Settings.findOne({}) || await Settings.create({});
 
-            const lastTx = await Transaction.findOne(filter).sort({ createdAt: -1 });
-            if (lastTx) {
-                const diffSeconds = (Date.now() - lastTx.createdAt.getTime()) / 1000;
-                if (lastTx.amount === amountEGP && diffSeconds < 300) {
-                    const waitTime = Math.ceil(300 - diffSeconds);
-                    await editPrompt(ctx, `⚠️ <b>تحذير أمني:</b> لقد قمت بإرسال نفس الحوالة مؤخراً.\n⏳ يرجى الانتظار <b>${waitTime} ثانية</b>.`, Markup.inlineKeyboard([[Markup.button.callback('🔙 رجوع', 'back_to_step_1')]]));
-                    ctx.wizard.selectStep(2); return; 
-                } else if (diffSeconds < 60) {
-                    const waitTime = Math.ceil(60 - diffSeconds);
-                    await editPrompt(ctx, `⚠️ <b>تحذير أمني:</b> الرجاء الانتظار <b>${waitTime} ثانية</b> قبل إرسال حوالة أخرى لنفس الرقم.`, Markup.inlineKeyboard([[Markup.button.callback('🔙 رجوع', 'back_to_step_1')]]));
-                    ctx.wizard.selectStep(2); return; 
-                }
+            if (ctx.wizard.state.isMainBot) {
+                const user = await User.findOne({ telegramId });
+                tier = user.tier || 1;
+                currentBalance = user.balance || 0;
+                creditLimit = user.creditLimit || 0;
+            } else {
+                const company = await ClientBot.findById(ctx.wizard.state.botData._id);
+                tier = company.tier || 1;
+                currentBalance = company.balance || 0;
+                creditLimit = company.creditLimit || 0;
             }
 
-            const requiredLYD = amountLYD;
-            let TargetModel = isMainBot ? User : ClientBot;
-            let targetFilter = isMainBot ? { telegramId } : { _id: botData._id };
-            let employeeName = ctx.from.first_name;
+            let baseRate = set.rateLevel1 || 6.40;
+            if (tier === 2) baseRate = set.rateLevel2 || 6.45;
+            if (tier === 3) baseRate = set.rateLevel3 || 6.50;
 
+            let finalRate = baseRate;
+            if (ctx.wizard.state.transferType === 'post_account') {
+                finalRate = baseRate - 0.05; 
+            } else if (ctx.wizard.state.transferType === 'post_card') {
+                finalRate = baseRate - 0.15; 
+            }
+
+            if (finalRate <= 0) finalRate = baseRate;
+
+            const costLYD = parseFloat((amount / finalRate).toFixed(3));
+            ctx.wizard.state.costLYD = costLYD;
+            ctx.wizard.state.finalRate = finalRate;
+
+            const availableFunds = currentBalance + creditLimit;
+
+            if (costLYD > availableFunds) {
+                await editPrompt(ctx, 
+                    `❌ <b>رصيدك غير كافٍ.</b>\n\n` +
+                    `💰 رصيدك الحالي: ${currentBalance.toFixed(2)} دينار\n` +
+                    `💳 الحد الائتماني (السلفة): ${creditLimit.toFixed(2)} دينار\n` +
+                    `🟢 إجمالي المتاح: ${availableFunds.toFixed(2)} دينار\n\n` +
+                    `⚠️ بينما تكلفة التحويل: ${costLYD} دينار.`, 
+                    {}
+                );
+                return ctx.scene.leave();
+            }
+
+            let summaryType = ctx.wizard.state.transferType === 'post_account' ? 'حساب بريد' : 'بطاقة عميل';
+            let summaryMsg = `🧾 <b>مراجعة تفاصيل التحويل (${summaryType}):</b>\n\n`;
+            
+            if (ctx.wizard.state.transferType === 'post_account') {
+                summaryMsg += `📞 <b>رقم الحساب:</b> <code>${ctx.wizard.state.accountNumber}</code>\n`;
+                summaryMsg += `👤 <b>اسم صاحب الحساب:</b> ${ctx.wizard.state.accountName}\n`;
+            } else {
+                summaryMsg += `👤 <b>الاسم رباعي:</b> ${ctx.wizard.state.accountName}\n`;
+                summaryMsg += `🆔 <b>الرقم القومي:</b> <code>${ctx.wizard.state.nationalId}</code>\n`;
+                summaryMsg += `📍 <b>المحافظة:</b> ${ctx.wizard.state.governorate}\n`;
+            }
+            
+            summaryMsg += `💵 <b>المبلغ:</b> ${amount} EGP\n`;
+            summaryMsg += `💱 <b>سعر الصرف (بعد الخصم):</b> ${finalRate.toFixed(2)}\n`;
+            summaryMsg += `💰 <b>التكلفة الإجمالية:</b> ${costLYD} دينار\n\n`;
+            
+            if (costLYD > currentBalance) {
+                summaryMsg += `⚠️ <b>ملاحظة:</b> سيتم سحب جزء من هذا المبلغ من حدك الائتماني.\n\n`;
+            }
+
+            summaryMsg += `هل ترغب في تأكيد التحويل وإرسال الطلب للإدارة؟`;
+
+            await editPrompt(ctx, summaryMsg, 
+                Markup.inlineKeyboard([
+                    [Markup.button.callback('✅ تأكيد التحويل', 'confirm_post_tx')],
+                    [Markup.button.callback('❌ إلغاء', 'cancel_tx')]
+                ])
+            );
+            return ctx.wizard.next();
+        }
+    },
+
+    // الخطوة 4: تأكيد الإرسال (محمي بالخصم الذري 🛡️)
+    async (ctx) => {
+        if (!ctx.callbackQuery) {
+            if (ctx.message) await ctx.deleteMessage().catch(()=>{});
+            return;
+        }
+        await ctx.answerCbQuery('⏳ جاري إرسال الطلب للإدارة...').catch(()=>{});
+
+        if (ctx.callbackQuery.data === 'cancel_tx') {
+            await editPrompt(ctx, '✅ تم الإلغاء.', {});
+            return ctx.scene.leave();
+        }
+
+        if (ctx.callbackQuery.data === 'confirm_post_tx') {
             try {
+                const { isMainBot, botData, transferType, accountName, accountNumber, idCardImage, amount, costLYD, finalRate, nationalId, governorate } = ctx.wizard.state;
+                const telegramId = ctx.from.id.toString();
+
+                let TargetModel = isMainBot ? User : ClientBot;
+                let targetFilter = isMainBot ? { telegramId } : { _id: botData._id };
+                let employeeName = ctx.from.first_name;
+                let companyName = isMainBot ? 'عميل فردي' : botData.name;
+                let clientBotIdForTx = isMainBot ? null : botData._id;
+
                 let accountDoc = await TargetModel.findOne(targetFilter);
                 if (!accountDoc) {
                     await editPrompt(ctx, '❌ الحساب غير موجود.', {});
                     return ctx.scene.leave();
                 }
 
-                if (isMainBot) { employeeName = accountDoc.name; } 
-                else {
+                if (isMainBot) {
+                    employeeName = accountDoc.name;
+                } else {
                     const emp = await ClientEmployee.findOne({ telegramId, clientBotId: botData._id });
                     if (emp) employeeName = emp.name;
                 }
 
                 const creditLimit = accountDoc.creditLimit || 0;
-                const minRequiredBalance = requiredLYD - creditLimit;
+                const minRequiredBalance = costLYD - creditLimit;
 
+                // 🛡️ الخصم الذري لحماية الرصيد ومنع السحب المزدوج
                 const updatedAccount = await TargetModel.findOneAndUpdate(
                     { ...targetFilter, balance: { $gte: minRequiredBalance } },
-                    { $inc: { balance: -requiredLYD } },
+                    { $inc: { balance: -costLYD } },
                     { new: true }
                 );
 
                 if (!updatedAccount) {
-                    await editPrompt(ctx, '❌ <b>فشلت العملية!</b> الرصيد غير كافٍ.', {});
+                    await editPrompt(ctx, '❌ <b>فشلت العملية!</b> الرصيد غير كافٍ أو هناك عملية أخرى قيد التنفيذ استهلكت رصيدك.', {});
                     return ctx.scene.leave();
                 }
 
-                const counter = await Counter.findOneAndUpdate({ name: 'transaction' }, { $inc: { value: 1 } }, { upsert: true, new: true });
-                const yy = new Date().getFullYear().toString().slice(-2);
+                // 🟢 توليد رقم تسلسلي فريد
+                const counter = await Counter.findOneAndUpdate(
+                    { name: 'transaction' }, { $inc: { value: 1 } }, { upsert: true, new: true }
+                );
+                const yy = new Date().getFullYear().toString().slice(-2); 
                 const mm = (new Date().getMonth() + 1).toString().padStart(2, '0');
-                const customOrderId = `ATT-${yy}${mm}-${counter.value.toString().padStart(4, '0')}`;
+                const customOrderId = `ATT-${yy}${mm}-${counter.value.toString().padStart(4, '0')}`; 
+
+                let dbAccountName = accountName;
+                if (transferType === 'post_card') {
+                    dbAccountName = `${accountName}\n🆔 الرقم القومي: <code>${nationalId}</code>\n📍 المحافظة: ${governorate}`;
+                }
 
                 const newTx = await Transaction.create({
-                    userId: telegramId,
-                    amount: amountEGP, 
-                    costLYD: requiredLYD,
-                    exchangeRate: exchangeRate,
-                    vodafoneNumber: vodafoneNumber,
-                    notes: transferNote, 
-                    status: 'pending',
                     customId: customOrderId,
-                    clientBotId: isMainBot ? null : botData._id,
-                    companyName: isMainBot ? 'عميل فردي' : botData.name,
-                    employeeName: employeeName
+                    userId: telegramId, clientBotId: clientBotIdForTx, companyName, employeeName,
+                    transferType, accountName: dbAccountName, accountNumber, idCardImage,
+                    amount, costLYD, exchangeRate: finalRate, status: 'pending'
                 });
 
-                // 🟢 استدعاء المحرك ليرسل رسالة التتبع الجديدة!
-                await ctx.deleteMessage(ctx.wizard.state.promptMsgId).catch(()=>{});
-                await ctx.reply(`✅ <b>تم تقديم الطلب بنجاح!</b>\nيرجى متابعة سجل الحوالة بالأسفل 👇`, { parse_mode: 'HTML' });
-                
-                await updateClientTracking(newTx._id, 'sent_to_admin');
+                await editPrompt(ctx, `✅ <b>تم خصم ${costLYD} دينار من رصيدك وإرسال الطلب للإدارة بنجاح.</b>\nرقم الطلب: <code>${customOrderId}</code>`, {});
 
-                if (!isMainBot) {
-                    try {
-                        const companyBotAPI = new Telegram(botData.token);
-                        const colleagues = await ClientEmployee.find({ clientBotId: botData._id, status: 'active', telegramId: { $ne: telegramId } });
-                        if (colleagues.length > 0) {
-                            const broadcastMsg = `📢 <b>إشعار للشركة: تم إرسال طلب جديد</b>\n\n👨‍💻 <b>بواسطة الموظف:</b> ${employeeName}\n━━━━━━━━━━━━━━\n🧾 <b>رقم الطلب:</b> <code>${newTx.customId}</code>\n📞 <b>الرقم المحول إليه:</b> <code>${vodafoneNumber}</code>\n🇪🇬 <b>المبلغ:</b> ${amountEGP} جنيه\n💰 <b>تم خصم:</b> ${requiredLYD.toFixed(2)} دينار`;
-                            for (const col of colleagues) {
-                                await companyBotAPI.sendMessage(col.telegramId, broadcastMsg, { parse_mode: 'HTML' }).catch(()=>{});
+                try {
+                    const adminAPI = new Telegram(process.env.ADMIN_BOT_TOKEN);
+                    const admins = await Admin.find({});
+                    
+                    let typeLabel = transferType === 'post_account' ? 'حساب بريد' : 'بطاقة عميل';
+                    let accDetails = `📞 الرقم/الحساب: <code>${accountNumber || '---'}</code>`;
+                    if (dbAccountName) accDetails += `\n👤 الاسم: ${dbAccountName}`; 
+                    
+                    const adminMsgText = `🔔 <b>طلب تحويل جديد استلم الآن (${typeLabel}):</b>\n🏢 الجهة: ${companyName}\n👨‍💻 الموظف: ${employeeName}\n${accDetails}\n💵 المبلغ: ${amount} EGP\n💰 التكلفة: ${costLYD} LYD\n🧾 رقم الطلب: <code>${customOrderId}</code>`;
+                    
+                    const inlineKb = {
+                        inline_keyboard: [
+                            [{ text: '🤖 تحويل لبوت تنفيذي', callback_data: `forward_${newTx._id}` }],
+                            [{ text: '❌ إلغاء العملية', callback_data: `cancelReq_${newTx._id}` }]
+                        ]
+                    };
+
+                    let idUrl = null;
+                    if (transferType === 'post_card' && idCardImage) {
+                        try {
+                            let cToken = process.env.CLIENT_BOT_TOKEN;
+                            if (botData && botData.token) cToken = botData.token;
+                            const tempApi = new Telegram(cToken);
+                            idUrl = (await tempApi.getFileLink(idCardImage)).href;
+                        } catch(e){}
+                    }
+
+                    let savedAdminMsgs = [];
+                    for (const admin of admins) {
+                        if (admin.telegramId && !admin.webUsername) {
+                            if (idUrl) {
+                                const sentMsg = await adminAPI.sendPhoto(admin.telegramId, { url: idUrl }, { caption: adminMsgText, parse_mode: 'HTML', reply_markup: inlineKb }).catch(()=>{});
+                                if (sentMsg) savedAdminMsgs.push({ telegramId: admin.telegramId, messageId: sentMsg.message_id });
+                            } else {
+                                const sentMsg = await adminAPI.sendMessage(admin.telegramId, adminMsgText, { parse_mode: 'HTML', reply_markup: inlineKb }).catch(()=>{});
+                                if (sentMsg) savedAdminMsgs.push({ telegramId: admin.telegramId, messageId: sentMsg.message_id });
                             }
                         }
-                    } catch(e) {}
-                }
-
-                const sourceHeader = isMainBot ? `👤 <b>عميل فردي:</b> ${employeeName}` : `🏢 <b>الشركة:</b> ${botData.name}\n👨‍💻 <b>الموظف:</b> ${employeeName}`;
-                const adminNoteDisplay = transferNote ? `\n📝 <b>ملاحظة العميل:</b> <i>${transferNote}</i>` : '';
-                
-                const msgText = `🔔 <b>طلب تحويل فودافون كاش!</b>\n\n${sourceHeader}\n📞 <b>الرقم:</b> <code>${newTx.vodafoneNumber}</code>\n🇪🇬 <b>المبلغ المطلوب:</b> ${newTx.amount} EGP\n🇱🇾 <b>الدفع:</b> ${newTx.costLYD.toFixed(2)} LYD (سعر: ${exchangeRate})\n🧾 <b>رقم الطلب:</b> <code>${newTx.customId}</code>${adminNoteDisplay}`; 
-                
-                const msgMarkup = {
-                    parse_mode: 'HTML',
-                    ...Markup.inlineKeyboard([
-                        [Markup.button.callback('🤖 تحويل لبوت تنفيذي', `forward_${newTx._id}`)],
-                        [Markup.button.callback('❌ إلغاء العملية', `cancelReq_${newTx._id}`)]
-                    ])
-                };
-
-                const allAdmins = await Admin.find({});
-                let savedAdminMsgs = [];
-                for (const admin of allAdmins) {
-                    if (admin.telegramId && !admin.webUsername) {
-                        try {
-                            const sentMsg = await adminBotAPI.sendMessage(admin.telegramId, msgText, msgMarkup);
-                            if(sentMsg) savedAdminMsgs.push({ telegramId: admin.telegramId, messageId: sentMsg.message_id });
-                        } catch (err) {}
                     }
-                }
-                
-                if (savedAdminMsgs.length > 0) {
-                    newTx.adminMessages = savedAdminMsgs;
-                    await newTx.save();
-                }
-                    
+                    if(savedAdminMsgs.length > 0) {
+                        newTx.adminMessages = savedAdminMsgs;
+                        await newTx.save();
+                    }
+                } catch(err) {}
+
             } catch (error) {
                 console.error(error);
-                await editPrompt(ctx, 'حدث خطأ داخلي أثناء حفظ المعاملة.', {});
+                await editPrompt(ctx, '❌ حدث خطأ أثناء المعالجة.', {});
             }
             return ctx.scene.leave();
         }
     }
 );
 
-module.exports = transferWizard;
+module.exports = postTransferWizard;

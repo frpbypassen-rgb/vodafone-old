@@ -1,10 +1,9 @@
-// bots/executor/scenes/cancelExecScene.js
+// executor/scenes/cancelExecScene.js
 const { Scenes, Markup, Telegram } = require('telegraf');
 const Transaction = require('../../../models/Transaction');
 const ClientBot = require('../../../models/ClientBot');
 const Admin = require('../../../models/Admin');
 const User = require('../../../models/User');
-const { updateClientTracking } = require('../../../services/clientTrackingService');
 
 const editPrompt = async (ctx, text, markup = {}) => {
     try {
@@ -25,7 +24,7 @@ const cancelExecWizard = new Scenes.WizardScene(
     async (ctx) => {
         ctx.wizard.state.txId = ctx.scene.state.txId;
         ctx.wizard.state.promptMsgId = ctx.scene.state.promptMsgId;
-        await editPrompt(ctx, `❌ <b>إلغاء تنفيذ الطلب</b>\n\nالرجاء كتابة سبب إلغاء الحوالة لتحديث لوحة العميل وإشعار الإدارة (مثال: المحفظة لا تقبل، الرقم خطأ، إلخ):`, Markup.inlineKeyboard([[Markup.button.callback('🔙 تراجع', 'cancel_back')]]));
+        await editPrompt(ctx, `❌ <b>إلغاء تنفيذ الطلب</b>\n\nالرجاء كتابة سبب إلغاء الحوالة (مثال: المحفظة لا تقبل، الرقم خطأ، إلخ):`, Markup.inlineKeyboard([[Markup.button.callback('🔙 تراجع', 'cancel_back')]]));
         return ctx.wizard.next();
     },
     async (ctx) => {
@@ -49,7 +48,7 @@ const cancelExecWizard = new Scenes.WizardScene(
                 return;
             }
 
-            await editPrompt(ctx, '⏳ <i>جاري معالجة الإلغاء وإعادة الرصيد للعميل...</i>');
+            await editPrompt(ctx, '⏳ <i>جاري معالجة الإلغاء...</i>');
 
             try {
                 const tx = await Transaction.findById(ctx.wizard.state.txId);
@@ -62,9 +61,19 @@ const cancelExecWizard = new Scenes.WizardScene(
                 if (tx.clientBotId) await ClientBot.findByIdAndUpdate(tx.clientBotId, { $inc: { balance: tx.costLYD } });
                 else await User.findOneAndUpdate({ telegramId: tx.userId }, { $inc: { balance: tx.costLYD } });
 
-                // 🚀 استدعاء محرك التتبع للإلغاء
-                await updateClientTracking(tx._id, 'rejected', reason);
+                let clientAPI;
+                if (tx.clientBotId) {
+                    const comp = await ClientBot.findById(tx.clientBotId);
+                    if (comp) clientAPI = new Telegram(comp.token);
+                }
+                if (!clientAPI) clientAPI = new Telegram(process.env.CLIENT_BOT_TOKEN);
+                
+                // إشعار العميل المفصل
+                const clientMsg = `❌ <b>تم إلغاء طلب التحويل وإرجاع الرصيد!</b>\n\n👤 <b>المرسل:</b> ${tx.employeeName || 'غير محدد'}\n🧾 <b>رقم العملية:</b> <code>${tx.customId || tx._id}</code>\n📞 <b>رقم الهاتف/الحساب:</b> <code>${tx.vodafoneNumber || tx.accountNumber || '---'}</code>\n💵 <b>المبلغ:</b> ${tx.amount} EGP\n⚠️ <b>سبب الإلغاء:</b> ${reason}`;
+                
+                try { await clientAPI.sendMessage(tx.userId, clientMsg, { parse_mode: 'HTML' }); } catch(e){}
 
+                // إشعار الإدارة المفصل
                 const adminAPI = new Telegram(process.env.ADMIN_BOT_TOKEN);
                 const adminMsg = `🚨 <b>تنبيه للإدارة: تم إلغاء عملية من قِبل المنفذ!</b>\n\n🏢 <b>الجهة/العميل:</b> ${tx.companyName || 'عميل فردي'}\n👤 <b>الموظف الطالب:</b> ${tx.employeeName || 'غير محدد'}\n🤖 <b>بواسطة المنفذ:</b> ${tx.executorName}\n\n🧾 <b>رقم الطلب:</b> <code>${tx.customId || tx._id}</code>\n📞 <b>الرقم/الحساب:</b> <code>${tx.vodafoneNumber || tx.accountNumber || '---'}</code>\n💵 <b>المبلغ:</b> ${tx.amount} EGP\n🇱🇾 <b>التكلفة المسترجعة:</b> ${tx.costLYD.toFixed(2)} LYD\n⚠️ <b>سبب الإلغاء:</b> <b>${reason}</b>`;
                 

@@ -1,3 +1,4 @@
+// routes/settings.js
 const express = require('express');
 const router = express.Router();
 const Settings = require('../models/Settings');
@@ -13,7 +14,9 @@ router.use(requireAuth);
 
 router.get('/', async (req, res) => {
     const settings = await Settings.findOne({}) || await Settings.create({});
-    res.render('settings', { settings });
+    // نمرر البوتات لكي تظهر في القائمة المنسدلة لاختيار بوت التوجيه
+    const executorBots = await ExecutorBot.find({ status: 'active', isManagerBot: false });
+    res.render('settings', { settings, executorBots });
 });
 
 router.post('/update', async (req, res) => {
@@ -21,6 +24,23 @@ router.post('/update', async (req, res) => {
     data.isManualClosed = data.isManualClosed === 'true';
     await Settings.updateOne({}, data, { upsert: true });
     res.redirect('/settings');
+});
+
+// 🚀 المسار الجديد للتحكم في التوجيه التلقائي عبر الـ AJAX من الموقع
+router.post('/toggle-auto-route', async (req, res) => {
+    try {
+        const { isEnabled, botId } = req.body;
+        const set = await Settings.findOne({}) || await Settings.create({});
+        
+        set.autoRouteEnabled = isEnabled;
+        if (botId) set.autoRouteBotId = botId;
+
+        await set.save();
+        res.json({ success: true, isEnabled: set.autoRouteEnabled });
+    } catch (e) {
+        console.error(e);
+        res.status(500).json({ success: false, error: 'حدث خطأ أثناء الحفظ' });
+    }
 });
 
 router.get('/content', async (req, res) => {
@@ -49,7 +69,6 @@ router.get('/bots', async (req, res) => {
     res.render('bots', { executorBots, clientBots });
 });
 
-// 🚀 مسار إضافة البوتات (محدث لدعم الـ API)
 router.post('/bots/add-executor', async (req, res) => {
     try { 
         const { name, botType, token, apiUrl, apiToken } = req.body; 

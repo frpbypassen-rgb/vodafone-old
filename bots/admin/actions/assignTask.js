@@ -3,9 +3,7 @@ const { Telegram, Markup } = require('telegraf');
 const Transaction = require('../../../models/Transaction');
 const ExecutorBot = require('../../../models/ExecutorBot');
 const Employee = require('../../../models/Employee');
-const ClientBot = require('../../../models/ClientBot'); 
-// 🟢 استدعاء محرك التتبع
-const { updateClientTracking } = require('../../../services/clientTrackingService');
+const ClientBot = require('../../../models/ClientBot'); // 🟢 جلب نموذج بوت العميل لسحب صورة البطاقة إن وجدت
 
 module.exports = async (ctx) => {
     try {
@@ -36,9 +34,6 @@ module.exports = async (ctx) => {
 
         await tx.save();
 
-        // 🟢 تحديث لوحة العميل الحية (تتغير تلقائياً إلى 🟠 في قائمة الانتظار)
-        await updateClientTracking(tx._id, 'processing');
-
         const execBotAPI = new Telegram(execBot.token);
         const displayId = tx.customId || tx._id.toString();
 
@@ -59,6 +54,7 @@ module.exports = async (ctx) => {
 
         let successCount = 0;
 
+        // 🟢 تجهيز البيانات بناءً على نوع التحويل لترسل للمنفذ
         let typeLabel = '📱 فودافون كاش';
         if(tx.transferType === 'post_account') typeLabel = '📮 حساب بريد';
         if(tx.transferType === 'post_card') typeLabel = '💳 بطاقة عميل';
@@ -69,6 +65,7 @@ module.exports = async (ctx) => {
 
         const msg = `🔔 <b>مهمة تحويل جديدة من الإدارة! (${typeLabel})</b>\n\n${accDetails}💵 <b>المبلغ:</b> ${tx.amount} EGP\n🧾 <b>رقم الطلب:</b> <code>${displayId}</code>${noteDisplay}`;
 
+        // 🟢 سحب صورة البطاقة (إن وجدت) لكي يتم إرسالها للمنفذ
         let idUrl = null;
         if (tx.transferType === 'post_card' && tx.idCardImage) {
             try {
@@ -89,6 +86,7 @@ module.exports = async (ctx) => {
                 const markup = { inline_keyboard: [[{ text: btnText, callback_data: `accept_task_${tx._id}` }]] };
 
                 let sentMsg;
+                // 🟢 إرسال الطلب للموظف كصورة (إن كانت بطاقة بريد) أو نص عادي
                 if (idUrl) {
                     sentMsg = await execBotAPI.sendPhoto(member.telegramId, { url: idUrl }, { caption: msg, parse_mode: 'HTML', reply_markup: markup }).catch(() => execBotAPI.sendMessage(member.telegramId, msg, { parse_mode: 'HTML', reply_markup: markup }));
                 } else {
@@ -109,6 +107,7 @@ module.exports = async (ctx) => {
 
         await ctx.answerCbQuery(`✅ تم التحويل بنجاح لبوت: ${execBot.name}\n🔔 تم إشعار ${successCount} موظف.`, { show_alert: true });
 
+        // 🟢 إخفاء الطلب من الإدارة لمنع الضغط المزدوج مع تحديث نوع الطلب في الإشعار
         await ctx.editMessageText(
             `✅ <b>تـم تـحـويـل الـطـلـب! (${typeLabel})</b>\n\n` +
             `🧾 <b>رقم الطلب:</b> <code>${displayId}</code>\n` +

@@ -6,6 +6,7 @@ const User = require('../../../models/User');
 const ClientBot = require('../../../models/ClientBot');
 const ClientEmployee = require('../../../models/ClientEmployee');
 const Transaction = require('../../../models/Transaction');
+const { recordBalanceAdjustment, parseSignedAmount } = require('../../../services/balanceAdjustmentService');
 
 // 🛠️ دالة مساعدة لإنشاء الإكسيل
 const buildExcelReport = async (ctx, targetId, targetType, targetName, targetPhone, reportType) => {
@@ -236,20 +237,28 @@ const clientControlWizard = new Scenes.WizardScene(
                 targetObj.creditLimit = l;
             }
             if (pendingAction === 'action_deposit') {
-                const amount = parseFloat(input);
-                if (isNaN(amount) || amount <= 0) return ctx.reply('❌ رقم غير صالح.');
-                
-                targetObj.balance += amount;
-                
-                const depId = `DEP-${new Date().getTime().toString().slice(-6)}`;
-                await Transaction.create({
-                    userId: ctx.from.id.toString(),
-                    amount: amount, costLYD: 0, vodafoneNumber: '01000000000',
-                    status: 'deposit', customId: depId,
-                    clientBotId: targetType === 'COMPANY' ? targetObj._id : null,
-                    companyName: targetType === 'COMPANY' ? targetObj.name : 'عميل فردي',
-                    employeeName: 'الإدارة العليا'
+                let amount;
+                try {
+                    amount = parseSignedAmount(input);
+                } catch (_) {
+                    return ctx.reply('❌ رقم غير صالح.');
+                }
+                if (amount <= 0) return ctx.reply('❌ رقم غير صالح.');
+
+                const result = await recordBalanceAdjustment({
+                    entityModel: targetType === 'COMPANY' ? 'ClientBot' : 'User',
+                    entityId: targetObj._id,
+                    amount,
+                    transactionData: {
+                        userId: targetType === 'COMPANY' ? ctx.from.id.toString() : targetObj.telegramId,
+                        clientBotId: targetType === 'COMPANY' ? targetObj._id : null,
+                        vodafoneNumber: '01000000000',
+                        companyName: targetType === 'COMPANY' ? targetObj.name : 'عميل فردي',
+                        employeeName: 'الإدارة العليا'
+                    },
+                    description: targetType === 'COMPANY' ? `إيداع رصيد شركة ${targetObj.name}` : `إيداع رصيد عميل ${targetObj.name}`
                 });
+                targetObj.balance = result.balanceAfter;
                 await ctx.reply(`✅ تم إضافة إيداع بقيمة ${amount} بنجاح.`);
             }
 

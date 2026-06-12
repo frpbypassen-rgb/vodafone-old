@@ -1,7 +1,7 @@
 // bots/admin/scenes/rechargeUserScene.js
 const { Scenes, Markup, Telegram } = require('telegraf');
 const User = require('../../../models/User');
-const Transaction = require('../../../models/Transaction');
+const { recordBalanceAdjustment, parseSignedAmount } = require('../../../services/balanceAdjustmentService');
 
 const clientBotAPI = new Telegram(process.env.CLIENT_BOT_TOKEN);
 
@@ -62,33 +62,36 @@ const rechargeUserWizard = new Scenes.WizardScene(
             return ctx.scene.leave();
         }
 
-        const amount = parseFloat(ctx.message?.text?.trim());
-        if (isNaN(amount) || amount <= 0) {
+        let amount;
+        try {
+            amount = parseSignedAmount(ctx.message?.text);
+        } catch (_) {
             return ctx.reply('⚠️ يرجى إدخال مبلغ صحيح (أرقام فقط أكبر من الصفر):');
         }
+        if (amount <= 0) return ctx.reply('⚠️ يرجى إدخال مبلغ صحيح (أرقام فقط أكبر من الصفر):');
 
         const user = ctx.wizard.state.user;
 
         try {
             await ctx.reply('⏳ جاري إضافة الرصيد وتوثيق العملية...');
 
-            // 1. إنشاء معاملة جديدة بحالة 'deposit' لتدخل في التقفيل اليومي
-            const depositTx = await Transaction.create({
-                userId: user.telegramId,
-                clientBotId: null, // لأنه عميل فردي
-                amount: amount, // المبلغ المودع
-                costLYD: 0, // لا توجد تكلفة لأنه إيداع وليس سحب
-                exchangeRate: 1, 
-                vodafoneNumber: 'إيداع نقدي', // كبيان للعملية
-                status: 'deposit',
-                customId: `DEP-${Date.now().toString().slice(-6)}`
+            const result = await recordBalanceAdjustment({
+                entityModel: 'User',
+                entityId: user._id,
+                amount,
+                transactionData: {
+                    userId: user.telegramId,
+                    clientBotId: null,
+                    exchangeRate: 1,
+                    vodafoneNumber: 'إيداع نقدي',
+                    companyName: 'عميل فردي',
+                    employeeName: 'الإدارة (إيداع)'
+                },
+                description: 'إيداع نقدي لعميل فردي من بوت الإدارة'
             });
+            user.balance = result.balanceAfter;
+            const depositTx = result.transaction;
 
-            // 2. تحديث رصيد العميل في قاعدة البيانات
-            user.balance += amount;
-            await user.save();
-
-            // 3. إرسال إشعار فوري للعميل عبر بوت العملاء الرئيسي
             const notifyMsg = `💰 <b>إشعار إيداع نقدي</b>\n\n` +
                               `مرحباً <b>${user.name}</b>،\n` +
                               `✅ تم سداد وإيداع مبلغ <b>${amount.toFixed(2)} دينار</b> في حسابك بنجاح.\n\n` +
@@ -100,7 +103,6 @@ const rechargeUserWizard = new Scenes.WizardScene(
                 console.error(`Failed to notify user ${user.telegramId}`);
             });
 
-            // 4. تأكيد العملية للإدارة
             await ctx.reply(
                 `✅ <b>تم شحن الرصيد بنجاح!</b>\n\n` +
                 `👤 العميل: ${user.name}\n` +

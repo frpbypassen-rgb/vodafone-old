@@ -1,7 +1,7 @@
 // bots/admin/scenes/rechargeCompanyScene.js
 const { Scenes, Markup } = require('telegraf');
 const ClientBot = require('../../../models/ClientBot');
-const Transaction = require('../../../models/Transaction'); // 🚀 تم نقل الاستدعاء للأعلى لتجنب التعارض
+const { recordBalanceAdjustment, parseSignedAmount } = require('../../../services/balanceAdjustmentService');
 
 const rechargeCompanyWizard = new Scenes.WizardScene(
     'RECHARGE_COMPANY_SCENE',
@@ -68,32 +68,32 @@ const rechargeCompanyWizard = new Scenes.WizardScene(
         }
 
         if (!ctx.message || !ctx.message.text) return;
-        const amount = parseFloat(ctx.message.text);
-        if (isNaN(amount) || amount <= 0) return ctx.reply('❌ مبلغ غير صالح! يرجى إرسال رقم صحيح.');
+        let amount;
+        try {
+            amount = parseSignedAmount(ctx.message.text);
+        } catch (_) {
+            return ctx.reply('❌ مبلغ غير صالح! يرجى إرسال رقم صحيح.');
+        }
+        if (amount <= 0) return ctx.reply('❌ مبلغ غير صالح! يرجى إرسال رقم صحيح.');
 
         try {
             const company = await ClientBot.findById(ctx.wizard.state.companyId);
             if (!company) return ctx.scene.leave();
 
-            // 1. تحديث الرصيد الفعلي للشركة
-            company.balance += amount;
-            await company.save();
-
-            // 2. توثيق العملية كإيداع (ليقرأه ملف الإكسيل كـ "قيمة مسددة")
-            const now = new Date();
-            const depId = `DEP-${now.getTime().toString().slice(-6)}`; 
-
-            await Transaction.create({
-                userId: ctx.from.id.toString(), // الذي قام بالشحن (الإدارة)
-                amount: amount, 
-                costLYD: 0,
-                vodafoneNumber: '01000000000', // رقم افتراضي مقبول لتوثيق الإيداع
-                status: 'deposit',
-                customId: depId,
-                clientBotId: company._id,
-                companyName: company.name,
-                employeeName: 'الإدارة (إيداع)' 
+            const result = await recordBalanceAdjustment({
+                entityModel: 'ClientBot',
+                entityId: company._id,
+                amount,
+                transactionData: {
+                    userId: ctx.from.id.toString(),
+                    clientBotId: company._id,
+                    vodafoneNumber: '01000000000',
+                    companyName: company.name,
+                    employeeName: 'الإدارة (إيداع)'
+                },
+                description: `إيداع رصيد شركة ${company.name} من بوت الإدارة`
             });
+            company.balance = result.balanceAfter;
 
             await ctx.reply(`✅ <b>تم الشحن وتوثيق العملية بنجاح!</b>\n\n🏢 <b>الشركة:</b> ${company.name}\n➕ <b>المبلغ المضاف:</b> ${amount} دينار\n💰 <b>الرصيد الجديد:</b> ${company.balance} دينار`, { parse_mode: 'HTML' });
 

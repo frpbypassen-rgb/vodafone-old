@@ -3,14 +3,13 @@ const { Scenes, Markup, Telegram } = require('telegraf');
 const Transaction = require('../../../models/Transaction');
 const User = require('../../../models/User');
 const ClientBot = require('../../../models/ClientBot');
-const { updateClientTracking } = require('../../../services/clientTrackingService');
 
 const cancelReasonScene = new Scenes.WizardScene(
     'CANCEL_REASON_SCENE',
     async (ctx) => {
         ctx.wizard.state.txId = ctx.scene.state.txId;
         await ctx.reply(
-            '⚠️ <b>إلغاء الطلب من الإدارة</b>\n\n📝 الرجاء كتابة سبب الإلغاء لتحديث لوحة العميل:', 
+            '⚠️ <b>إلغاء الطلب وحذفه نهائياً</b>\n\n📝 الرجاء كتابة سبب الإلغاء لإرساله للعميل:', 
             { parse_mode: 'HTML', ...Markup.inlineKeyboard([[Markup.button.callback('🔙 تراجع', 'cancel_action')]]) }
         );
         return ctx.wizard.next();
@@ -28,24 +27,41 @@ const cancelReasonScene = new Scenes.WizardScene(
         try {
             const tx = await Transaction.findById(ctx.wizard.state.txId);
             if (!tx) {
-                await ctx.reply('❌ الطلب غير موجود.');
+                await ctx.reply('❌ الطلب غير موجود أو تم حذفه مسبقاً.');
                 return ctx.scene.leave();
             }
 
+            // 🚀 1. إرجاع الرصيد بصمت للعميل (لأنه خُصم منه وقت الطلب)
             if (tx.clientBotId) {
                 await ClientBot.findByIdAndUpdate(tx.clientBotId, { $inc: { balance: tx.costLYD } });
             } else {
                 await User.findOneAndUpdate({ telegramId: tx.userId }, { $inc: { balance: tx.costLYD } });
             }
 
-            tx.status = 'rejected';
-            tx.notes = (tx.notes ? tx.notes + '\n' : '') + `[تم الإلغاء من الإدارة | السبب: ${reason}]`;
-            await tx.save();
+            const displayId = tx.customId || tx._id.toString();
 
-            // 🚀 استدعاء محرك التتبع للإلغاء
-            await updateClientTracking(tx._id, 'rejected', reason);
+            // 🚀 2. إرسال إشعار للعميل بالسبب
+            const msgToClient = `❌ <b>تم إلغاء طلب التحويل الخاص بك!</b>\n\n` +
+                                `🧾 <b>رقم الطلب:</b> <code>${displayId}</code>\n` +
+                                `📞 <b>الرقم المحول له:</b> <code>${tx.vodafoneNumber}</code>\n` +
+                                `💰 <b>المبلغ المسترجع:</b> ${tx.costLYD.toFixed(2)} دينار\n\n` +
+                                `📝 <b>سبب الإلغاء:</b> ${reason}`;
 
-            await ctx.reply(`✅ <b>تم إلغاء الطلب وتحديث لوحة العميل.</b>\n\n📝 السبب الذي سيظهر له: ${reason}`, { parse_mode: 'HTML' });
+            if (tx.clientBotId) {
+                const comp = await ClientBot.findById(tx.clientBotId);
+                if (comp) {
+                    const compAPI = new Telegram(comp.token);
+                    await compAPI.sendMessage(tx.userId, msgToClient, { parse_mode: 'HTML' }).catch(()=>{});
+                }
+            } else {
+                const clientBotAPI = new Telegram(process.env.CLIENT_BOT_TOKEN);
+                await clientBotAPI.sendMessage(tx.userId, msgToClient, { parse_mode: 'HTML' }).catch(()=>{});
+            }
+
+            // 🚀 3. مسح العملية نهائياً من قاعدة البيانات
+            await Transaction.findByIdAndDelete(tx._id);
+
+            await ctx.reply(`✅ <b>تم إلغاء الطلب وحذفه من السجلات نهائياً، وتم إشعار العميل.</b>\n\n📝 السبب: ${reason}`, { parse_mode: 'HTML' });
 
         } catch (err) {
             console.error(err);

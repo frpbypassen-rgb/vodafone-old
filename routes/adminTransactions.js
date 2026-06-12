@@ -1,11 +1,9 @@
 const express = require('express');
 const router = express.Router();
-const axios = require('axios'); 
+const https = require('https');
 const { Telegram } = require('telegraf');
 const multer = require('multer');
 const upload = multer({ storage: multer.memoryStorage() });
-const fs = require('fs');
-const path = require('path');
 
 const Transaction = require('../models/Transaction');
 const ExecutorBot = require('../models/ExecutorBot');
@@ -17,83 +15,41 @@ const Admin = require('../models/Admin');
 const Notification = require('../models/Notification');
 const SupportTicket = require('../models/SupportTicket');
 const { requireAuth } = require('../middlewares/auth');
+const { syncBotBalance } = require('../utils/helpers');
 
-const apiTransferQueue = require('../services/queueService');
-const { updateBalanceWithLedger } = require('../services/walletService');
+// 🚀 استدعاء محرك الـ API 
+const { executeTransferViaApi } = require('../services/externalApiService');
 
 router.use(requireAuth);
 
-// ===============================================
-// 🖼️ عرض صور الإثباتات (Proxy API) - القراءة المباشرة من السيرفر 🚀
-// ===============================================
 router.get(['/proxy/image/:id', '/proxy/image/:id/:index'], async (req, res) => {
     try {
-        const tx = await Transaction.findById(req.params.id).lean();
-        if (!tx) return res.status(404).send('لا توجد عملية');
+        const tx = await Transaction.findById(req.params.id);
+        if (!tx) return res.status(404).send('لا توجد صورة إثبات');
 
         const index = req.params.index ? parseInt(req.params.index) : 0;
         let photoId = null;
-        
         if (tx.proofImages && tx.proofImages.length > index) photoId = tx.proofImages[index];
         else if (tx.proofImage && index === 0) photoId = tx.proofImage; 
 
-        // 🟢 تغطية فورية: لو photoId غير موجود، لكن localProofImage موجود، نستخدمه فوراً
-        if (!photoId && tx.localProofImage) {
-            photoId = tx.localProofImage;
-        }
-
         if (!photoId) return res.status(404).send('لا توجد صورة إثبات');
 
-        // 1️⃣ الحل النهائي القاطع: قراءة من الهارد ديسك
-        if (photoId.startsWith('/uploads') || (tx.localProofImage && tx.localProofImage.startsWith('/uploads'))) {
-            const targetPath = photoId.startsWith('/uploads') ? photoId : tx.localProofImage;
-            const fullPath = path.join(process.cwd(), targetPath);
-            
-            if (fs.existsSync(fullPath)) {
-                res.set('Cache-Control', 'public, max-age=31536000');
-                return res.sendFile(fullPath); 
-            }
-        }
-
-        // 2️⃣ --- (دعم الصور القديمة جداً المحفوظة Base64) ---
-        if (photoId.startsWith('data:image')) {
-            const base64Data = photoId.replace(/^data:image\/\w+;base64,/, "");
-            res.set('Content-Type', 'image/jpeg'); res.set('Cache-Control', 'public, max-age=31536000');
-            return res.send(Buffer.from(base64Data, 'base64'));
-        }
-
-        // 3️⃣ --- (دعم الصور القديمة المحفوظة روابط) ---
-        if (photoId.startsWith('http')) {
-            const response = await axios.get(photoId, { responseType: 'arraybuffer' });
-            res.set('Content-Type', 'image/jpeg'); res.set('Cache-Control', 'public, max-age=31536000');
-            return res.send(Buffer.from(response.data));
-        }
-
-        // 4️⃣ --- (دعم الصور القديمة المحفوظة كـ File ID في تيليجرام) ---
         let tokensToTry = [];
-        if (tx.executorBotId) { const execBot = await ExecutorBot.findById(tx.executorBotId); if (execBot && execBot.token) tokensToTry.push(execBot.token); }
         if (process.env.ADMIN_BOT_TOKEN) tokensToTry.push(process.env.ADMIN_BOT_TOKEN);
         if (process.env.CLIENT_BOT_TOKEN) tokensToTry.push(process.env.CLIENT_BOT_TOKEN);
-        
-        let fileLink = null;
-        for (const token of [...new Set(tokensToTry)]) {
-            try { const api = new Telegram(token); const link = await api.getFileLink(photoId); if (link && link.href) { fileLink = link.href; break; } } catch (e) {}
-        }
-        
-        if (!fileLink) return res.status(404).send('تعذر الوصول للصورة القديمة في تيليجرام');
-        const response = await axios.get(fileLink, { responseType: 'arraybuffer' });
-        res.set('Content-Type', 'image/jpeg'); res.set('Cache-Control', 'public, max-age=31536000');
-        return res.send(Buffer.from(response.data));
+        if (tx.executorBotId) { const execBot = await ExecutorBot.findById(tx.executorBotId); if (execBot && execBot.token) tokensToTry.push(execBot.token); }
+        if (tx.clientBotId) { const clientBot = await ClientBot.findById(tx.clientBotId); if (clientBot && clientBot.token) tokensToTry.push(clientBot.token); }
 
-    } catch (error) { 
-        console.error('[Web Proxy Error]:', error.message);
-        res.status(500).send('خطأ داخلي'); 
-    }
+        let fileLink = null;
+        for (const token of tokensToTry) {
+            try { const api = new Telegram(token); fileLink = await api.getFileLink(photoId); if (fileLink) break; } catch(e) {}
+        }
+
+        if (!fileLink) return res.status(404).send('لا يمكن الوصول للصورة بسبب صلاحيات تيليجرام');
+        https.get(fileLink.href, (response) => { res.set('Content-Type', response.headers['content-type']); response.pipe(res); }).on('error', (e) => { res.status(500).send('خطأ في جلب الصورة'); });
+    } catch (error) { res.status(500).send('خطأ داخلي'); }
 });
 
-// ===============================================
-// 🔔 الإشعارات وسجل العمليات
-// ===============================================
 router.get('/api/notifications/unread', async (req, res) => {
     try { const notifs = await Notification.find({ isRead: false }).sort({ createdAt: -1 }); res.json({ count: notifs.length, notifications: notifs }); } catch (e) { res.status(500).json({ error: true }); }
 });
@@ -108,9 +64,8 @@ router.post('/api/notifications/read-all', async (req, res) => {
 
 router.get('/', async (req, res) => {
     try {
-        const startOfDay = new Date(); startOfDay.setHours(0, 0, 0, 0);
         const usersCount = await User.countDocuments(); const companiesCount = await ClientBot.countDocuments(); const executorsCount = await Employee.countDocuments();
-        const pendingTxs = await Transaction.countDocuments({ status: 'pending' }); const processingTxs = await Transaction.countDocuments({ status: { $in: ['processing', 'accepted'] } }); const completedTxs = await Transaction.countDocuments({ status: 'completed', updatedAt: { $gte: startOfDay } });
+        const pendingTxs = await Transaction.countDocuments({ status: 'pending' }); const processingTxs = await Transaction.countDocuments({ status: { $in: ['processing', 'accepted'] } }); const completedTxs = await Transaction.countDocuments({ status: 'completed' });
         res.render('index', { usersCount, companiesCount, executorsCount, pendingTxs, processingTxs, completedTxs, adminName: req.session.adminName });
     } catch (e) { res.status(500).send('خطأ داخلي'); }
 });
@@ -161,9 +116,6 @@ router.get('/transactions/print', async (req, res) => {
     } catch (e) { res.status(500).send('حدث خطأ أثناء إعداد التقرير.'); }
 });
 
-// ===============================================
-// 🚀 توجيه الطلبات (آلياً للبوت API وبشرياً)
-// ===============================================
 router.post('/transaction/:id/assign-executor', async (req, res) => {
     try {
         const txId = req.params.id; const executorBotId = req.body.executorBotId; const tx = await Transaction.findById(txId);
@@ -173,38 +125,106 @@ router.post('/transaction/:id/assign-executor', async (req, res) => {
 
         if (executorBot && !executorBot.isManagerBot) { 
             
+            // 🤖====================================================🤖
+            // 🚀 المسار الذكي: إذا كان هذا البوت آلياً (API Integration)
+            // 🤖====================================================🤖
+            if (executorBot.isApiBot) {
+                tx.status = 'processing';
+                tx.executorBotId = executorBot._id;
+                tx.executorBotName = executorBot.name;
+                await tx.save();
+
+                // التخاطب مع سيرفر الشركة الخارجية
+                const apiResult = await executeTransferViaApi(tx, executorBot);
+
+                if (apiResult.success) {
+                    // 1. إكمال العملية بنجاح
+                    tx.status = 'completed';
+                    tx.executorName = 'تنفيذ آلي (API)';
+                    tx.notes = (tx.notes ? tx.notes + '\n' : '') + `[مرجع الشركة الآلي: ${apiResult.external_transaction_id}]`;
+                    await tx.save();
+
+                    executorBot.balance -= tx.amount;
+                    await executorBot.save();
+
+                    // 2. إشعار العميل
+                    const clientMsg = `✅ <b>تـم تـنـفـيـذ طـلـبـك بـنـجـاح! (تحويل آلي)</b> ⚡\n\n🧾 <b>رقم الطلب:</b> <code>${tx.customId}</code>\n📞 <b>الرقم/الحساب:</b> <code>${tx.vodafoneNumber || tx.accountNumber}</code>\n💵 <b>المبلغ:</b> ${tx.amount} EGP\n💸 <b>التكلفة:</b> ${tx.costLYD.toFixed(2)} LYD`;
+                    let clientAPI = new Telegram(process.env.CLIENT_BOT_TOKEN);
+                    if (tx.clientBotId) {
+                        const comp = await ClientBot.findById(tx.clientBotId);
+                        if (comp) clientAPI = new Telegram(comp.token);
+                    }
+                    await clientAPI.sendMessage(tx.userId, clientMsg, { parse_mode: 'HTML' }).catch(()=>{});
+
+                    // 3. 🟢 إرسال Log النجاح لـ "بوت المراقبة البشري" (إن وجد)
+                    if (executorBot.parentBotId) {
+                        try {
+                            const monitorBot = await ExecutorBot.findById(executorBot.parentBotId);
+                            if (monitorBot && monitorBot.token) {
+                                const monitorAPI = new Telegram(monitorBot.token);
+                                const monitorStaff = await Employee.find({ botId: monitorBot._id, status: 'active' });
+                                const monitorMsg = `🟢 <b>سجل API (عملية ناجحة)</b>\n\n🤖 <b>عبر:</b> ${executorBot.name}\n🧾 <b>الطلب:</b> <code>${tx.customId}</code>\n📞 <b>الرقم:</b> <code>${tx.vodafoneNumber}</code>\n💵 <b>المبلغ:</b> ${tx.amount} EGP\n📝 <b>المرجع:</b> <code>${apiResult.external_transaction_id}</code>`;
+                                for (const staff of monitorStaff) {
+                                    if(staff.telegramId) await monitorAPI.sendMessage(staff.telegramId, monitorMsg, { parse_mode: 'HTML' }).catch(()=>{});
+                                }
+                            }
+                        } catch(e){}
+                    }
+
+                } else {
+                    // 🔴 فشل الـ API -> تحويل الطلب فوراً للبشر (Human Fallback)
+                    if (executorBot.parentBotId) {
+                        const monitorBot = await ExecutorBot.findById(executorBot.parentBotId);
+                        if (monitorBot) {
+                            // تغيير مسؤولية الطلب ليكون من نصيب الفريق البشري
+                            tx.executorBotId = monitorBot._id;
+                            tx.managerBotId = monitorBot.parentBotId || null;
+                            tx.executorBotName = monitorBot.name;
+                            tx.status = 'processing';
+                            tx.notes = (tx.notes ? tx.notes + '\n' : '') + `[فشل API - تم التحويل للمراقبة البشرية | السبب: ${apiResult.message}]`;
+                            await tx.save();
+
+                            const employees = await Employee.find({ botId: monitorBot._id, status: 'active' });
+                            const monitorAPI = new Telegram(monitorBot.token);
+                            
+                            let typeLabel = '📱 فودافون كاش'; if(tx.transferType === 'post_account') typeLabel = '📮 حساب بريد'; if(tx.transferType === 'post_card') typeLabel = '💳 بطاقة عميل';
+                            let accDetails = `📞 <b>الرقم/الحساب:</b> <code>${tx.vodafoneNumber || tx.accountNumber || '---'}</code>\n`;
+                            
+                            const fallbackMsg = `🚨 <b>تدخل بشري مطلوب! (فشل API)</b>\n\nحاول بوت (${executorBot.name}) تنفيذ العملية وفشل للسبب التالي:\n⚠️ <i>${apiResult.message}</i>\n\n${accDetails}💵 <b>المبلغ:</b> ${tx.amount} EGP\n🧾 <b>الطلب:</b> <code>${tx.customId}</code>`;
+                            const markup = { inline_keyboard: [[{ text: '🤝 قبول المهمة وتصحيحها يدوياً', callback_data: `accept_task_${tx._id}` }]] };
+                            
+                            for (const emp of employees) {
+                                if (emp.telegramId) {
+                                    try {
+                                        const sentMsg = await monitorAPI.sendMessage(emp.telegramId, fallbackMsg, { parse_mode: 'HTML', reply_markup: markup });
+                                        tx.broadcastMessages.push({ telegramId: emp.telegramId, messageId: sentMsg.message_id });
+                                    } catch (err) {}
+                                }
+                            }
+                            await tx.save();
+                        }
+                    } else {
+                        // لا يوجد فريق بشري مرتبط -> إرجاع الطلب للإدارة
+                        tx.status = 'pending'; 
+                        tx.notes = (tx.notes ? tx.notes + '\n' : '') + `[فشل التنفيذ الآلي: ${apiResult.message}]`;
+                        tx.executorBotId = undefined;
+                        tx.executorBotName = undefined;
+                        await tx.save();
+                    }
+                }
+                return res.redirect('/transactions');
+            }
+
+            // 👨‍💻====================================================👨‍💻
+            // المسار الكلاسيكي: للبوت البشري العادي
+            // 👨‍💻====================================================👨‍💻
+            tx.executorBotId = executorBot._id; tx.managerBotId = executorBot.parentBotId || null; tx.executorBotName = executorBot.name; tx.status = 'processing'; tx.broadcastMessages = []; 
+
             if (tx.adminMessages && tx.adminMessages.length > 0) {
                 const adminAPI = new Telegram(process.env.ADMIN_BOT_TOKEN);
                 for (const adminMsg of tx.adminMessages) await adminAPI.deleteMessage(adminMsg.telegramId, adminMsg.messageId).catch(() => {});
                 tx.adminMessages = []; 
             }
-
-            if (executorBot.isApiBot) {
-                tx.status = 'processing';
-                tx.executorBotId = executorBot._id;
-                tx.executorBotName = executorBot.name;
-                tx.managerBotId = executorBot.parentBotId || null; 
-                await tx.save();
-
-                if (executorBot.parentBotId) {
-                    try {
-                        const monitorBot = await ExecutorBot.findById(executorBot.parentBotId);
-                        if (monitorBot && monitorBot.token) {
-                            const monitorAPI = new Telegram(monitorBot.token);
-                            const monitorStaff = await Employee.find({ botId: monitorBot._id, status: 'active' });
-                            const startMsg = `🟡 <b>سجل API (في انتظار الطابور)</b>\n\n🤖 <b>البوت:</b> ${executorBot.name}\n🧾 <b>الطلب:</b> <code>${tx.customId}</code>\n📞 <b>الرقم:</b> <code>${tx.vodafoneNumber || tx.accountNumber}</code>\n💵 <b>المبلغ:</b> ${tx.amount} EGP\n⏳ <i>جاري الانتظار في طابور التنفيذ...</i>`;
-                            for (const staff of monitorStaff) {
-                                if (staff.telegramId) await monitorAPI.sendMessage(staff.telegramId, startMsg, { parse_mode: 'HTML' }).catch(()=>{});
-                            }
-                        }
-                    } catch(e){}
-                }
-
-                await apiTransferQueue.addJob(tx._id, executorBot._id);
-                return res.redirect('/transactions');
-            }
-
-            tx.executorBotId = executorBot._id; tx.managerBotId = executorBot.parentBotId || null; tx.executorBotName = executorBot.name; tx.status = 'processing'; tx.broadcastMessages = []; 
 
             const employees = await Employee.find({ botId: executorBot._id, status: 'active' });
             const execBotAPI = new Telegram(executorBot.token); 
@@ -306,9 +326,6 @@ router.post('/transaction/:id/emergency-alert', async (req, res) => {
     } catch (error) { res.redirect('/transactions'); }
 });
 
-// ===============================================
-// ⚙️ معالجة التسويات والتعديلات مدمجة بدفتر الأستاذ
-// ===============================================
 router.post('/transaction/:id/accept-deposit-web', async (req, res) => {
     try {
         const { imageBase64 } = req.body; const tx = await Transaction.findById(req.params.id);
@@ -320,16 +337,9 @@ router.post('/transaction/:id/accept-deposit-web', async (req, res) => {
 
         tx.status = 'deposit'; tx.proofImage = fileId; tx.updatedAt = new Date();
         const execBot = await ExecutorBot.findById(tx.executorBotId);
-        
-        if (execBot) { 
-            const execAPI = new Telegram(execBot.token); 
-            await execAPI.sendPhoto(tx.operatorId, fileId, { caption: `✅ <b>تمت الموافقة على طلب الإيداع!</b>\nالمبلغ: ${tx.amount} EGP`, parse_mode: 'HTML' }).catch(()=>{}); 
-            
-            await updateBalanceWithLedger('ExecutorBot', execBot._id, tx.amount, 'DEPOSIT', tx.customId, 'موافقة الإدارة على إيداع عهدة');
-        }
-        
+        if (execBot) { const execAPI = new Telegram(execBot.token); await execAPI.sendPhoto(tx.operatorId, fileId, { caption: `✅ <b>تمت الموافقة على طلب الإيداع!</b>\nالمبلغ: ${tx.amount} EGP`, parse_mode: 'HTML' }).catch(()=>{}); }
         await Transaction.updateOne({ _id: tx._id }, { $set: { executorWebAlert: { type: 'success', text: `تم قبول طلب الإيداع بقيمة ${tx.amount} EGP وتمت إضافة الرصيد لحسابك بنجاح.`, imageUrl: `/proxy/image/${tx._id}/0` } } }, { strict: false });
-        await tx.save(); 
+        await tx.save(); if (tx.executorBotId) await syncBotBalance(tx.executorBotId); 
         res.json({success: true});
     } catch(e) { res.json({success: false, error: e.message}); }
 });
@@ -355,17 +365,11 @@ router.post('/transaction/:id/edit-rate', async (req, res) => {
         if (!tx || ['rejected', 'cancelled_by_admin'].includes(tx.status)) return res.redirect('/transactions');
 
         const oldCost = tx.costLYD || 0; const newCost = tx.amount / newRate; const diff = newCost - oldCost; 
-        
-        if (tx.clientBotId) { 
-            await updateBalanceWithLedger('ClientBot', tx.clientBotId, -diff, 'ADJUSTMENT', tx.customId, `تعديل سعر الصرف لعملية إلى ${newRate}`);
-        } else if (tx.userId) { 
-            const user = await User.findOne({ telegramId: tx.userId }); 
-            if (user) await updateBalanceWithLedger('User', user._id, -diff, 'ADJUSTMENT', tx.customId, `تعديل سعر الصرف لعملية إلى ${newRate}`);
-        }
+        if (tx.clientBotId) { const company = await ClientBot.findById(tx.clientBotId); if (company) { company.balance -= diff; await company.save(); } } 
+        else if (tx.userId) { const user = await User.findOne({ telegramId: tx.userId }); if (user) { user.balance -= diff; await user.save(); } }
 
         const adminName = req.session.adminName || 'الإدارة';
-        tx.costLYD = newCost; tx.exchangeRate = newRate;
-        const oldRate = oldCost > 0 ? (tx.amount / oldCost).toFixed(3) : '0';
+        tx.costLYD = newCost; const oldRate = oldCost > 0 ? (tx.amount / oldCost).toFixed(3) : '0';
         tx.notes = (tx.notes ? tx.notes + '\n' : '') + `[تم تعديل السعر من ${oldRate} إلى ${newRate} بواسطة: ${adminName}]`;
         await tx.save(); res.redirect('/transactions'); 
     } catch (error) { res.redirect('/transactions'); }
@@ -383,44 +387,41 @@ router.post('/transaction/:id/edit-data', async (req, res) => {
         if (tx.status === 'deposit' || tx.status === 'deduction') {
             const diffAmount = newAmount - oldAmountEGP; const diffDeposit = (tx.status === 'deposit') ? diffAmount : -diffAmount;
             if (tx.userId === 'admin' && tx.executorBotId) {
-                await updateBalanceWithLedger('ExecutorBot', tx.executorBotId, diffDeposit, 'ADJUSTMENT', tx.customId, `تعديل مبلغ الإيداع/الخصم`);
+                const newNotes = (tx.notes ? tx.notes + '\n' : '') + `[تم تعديل (المبلغ: ${newAmount}، التاريخ: ${newDate.toLocaleString('en-GB')}) بواسطة: ${adminName}]`;
+                await Transaction.updateOne({ _id: tx._id }, { $set: { amount: newAmount, createdAt: newDate, updatedAt: newDate, notes: newNotes } }, { timestamps: false });
+                await syncBotBalance(tx.executorBotId); if (tx.managerBotId) await syncBotBalance(tx.managerBotId);
             } else {
-                if (tx.clientBotId) { 
-                    await updateBalanceWithLedger('ClientBot', tx.clientBotId, diffDeposit, 'ADJUSTMENT', tx.customId, `تعديل مبلغ الإيداع/الخصم`);
-                } else if (tx.userId) { 
-                    const user = await User.findOne({ telegramId: tx.userId }); 
-                    if (user) await updateBalanceWithLedger('User', user._id, diffDeposit, 'ADJUSTMENT', tx.customId, `تعديل مبلغ الإيداع/الخصم`);
-                }
+                if (tx.clientBotId) { const comp = await ClientBot.findById(tx.clientBotId); if (comp) { comp.balance += diffDeposit; await comp.save(); } } 
+                else if (tx.userId) { const user = await User.findOne({ telegramId: tx.userId }); if (user) { user.balance += diffDeposit; await user.save(); } }
+                const newNotes = (tx.notes ? tx.notes + '\n' : '') + `[تم تعديل (المبلغ: ${newAmount}، التاريخ: ${newDate.toLocaleString('en-GB')}) بواسطة: ${adminName}]`;
+                await Transaction.updateOne({ _id: tx._id }, { $set: { amount: newAmount, createdAt: newDate, updatedAt: newDate, notes: newNotes } }, { timestamps: false });
             }
         } else {
             const oldCostLYD = tx.costLYD; const newCostLYD = parseFloat((newAmount / tx.exchangeRate).toFixed(3));
             const diffEGP = newAmount - oldAmountEGP; const diffLYD = newCostLYD - oldCostLYD;
 
-            if (tx.clientBotId) { 
-                await updateBalanceWithLedger('ClientBot', tx.clientBotId, -diffLYD, 'ADJUSTMENT', tx.customId, `تعديل مبلغ الحوالة`);
-            } else if (tx.userId) { 
-                const user = await User.findOne({ telegramId: tx.userId }); 
-                if (user) await updateBalanceWithLedger('User', user._id, -diffLYD, 'ADJUSTMENT', tx.customId, `تعديل مبلغ الحوالة`);
-            }
+            if (tx.clientBotId) { const comp = await ClientBot.findById(tx.clientBotId); if (comp) { comp.balance -= diffLYD; await comp.save(); } } 
+            else if (tx.userId) { const user = await User.findOne({ telegramId: tx.userId }); if (user) { user.balance -= diffLYD; await user.save(); } }
 
             if (tx.status === 'completed' && tx.executorBotId) {
-                await updateBalanceWithLedger('ExecutorBot', tx.executorBotId, -diffEGP, 'ADJUSTMENT', tx.customId, `تعديل مبلغ الحوالة (منفذ)`);
+                const execBot = await ExecutorBot.findById(tx.executorBotId); if (execBot) { execBot.balance -= diffEGP; await execBot.save(); }
+                if (tx.managerBotId) { const mgrBot = await ExecutorBot.findById(tx.managerBotId); if (mgrBot) { mgrBot.balance -= diffEGP; await mgrBot.save(); } }
             }
-        }
 
-        const newNotes = (tx.notes ? tx.notes + '\n' : '') + `[تم تعديل (المبلغ: ${newAmount}، التاريخ: ${newDate.toLocaleString('en-GB')}) بواسطة: ${adminName}]`;
-        await Transaction.updateOne({ _id: tx._id }, { $set: { amount: newAmount, costLYD: tx.status==='deposit'||tx.status==='deduction'? 0 : newCostLYD, createdAt: newDate, updatedAt: newDate, notes: newNotes } }, { timestamps: false });
+            const newNotes = (tx.notes ? tx.notes + '\n' : '') + `[تم تعديل (المبلغ: ${newAmount}EGP، التاريخ: ${newDate.toLocaleString('en-GB')}) بواسطة: ${adminName}]`;
+            await Transaction.updateOne({ _id: tx._id }, { $set: { amount: newAmount, costLYD: newCostLYD, createdAt: newDate, updatedAt: newDate, notes: newNotes } }, { timestamps: false });
 
-        if (['processing', 'accepted'].includes(tx.status) && tx.executorBotId) {
-            try {
-                const execBot = await ExecutorBot.findById(tx.executorBotId);
-                if (execBot) {
-                    const execAPI = new Telegram(execBot.token);
-                    const alertMsg = `⚠️ <b>تنبيه من الإدارة:</b>\nتم تعديل بيانات الحوالة للطلب <code>${tx.customId}</code>\nالمبلغ القديم: <b>${oldAmountEGP} EGP</b>\nالمبلغ الجديد: <b>${newAmount} EGP</b>\nالرجاء الانتباه!`;
-                    if (tx.status === 'accepted' && tx.operatorId) await execAPI.sendMessage(tx.operatorId, alertMsg, { parse_mode: 'HTML' }).catch(()=>{});
-                    else if (tx.status === 'processing' && tx.broadcastMessages) for (const msg of tx.broadcastMessages) await execAPI.sendMessage(msg.telegramId, alertMsg, { parse_mode: 'HTML' }).catch(()=>{});
-                }
-            } catch(e) {}
+            if (['processing', 'accepted'].includes(tx.status) && tx.executorBotId) {
+                try {
+                    const execBot = await ExecutorBot.findById(tx.executorBotId);
+                    if (execBot) {
+                        const execAPI = new Telegram(execBot.token);
+                        const alertMsg = `⚠️ <b>تنبيه من الإدارة:</b>\nتم تعديل بيانات الحوالة للطلب <code>${tx.customId}</code>\nالمبلغ القديم: <b>${oldAmountEGP} EGP</b>\nالمبلغ الجديد: <b>${newAmount} EGP</b>\nالرجاء الانتباه!`;
+                        if (tx.status === 'accepted' && tx.operatorId) await execAPI.sendMessage(tx.operatorId, alertMsg, { parse_mode: 'HTML' }).catch(()=>{});
+                        else if (tx.status === 'processing' && tx.broadcastMessages) for (const msg of tx.broadcastMessages) await execAPI.sendMessage(msg.telegramId, alertMsg, { parse_mode: 'HTML' }).catch(()=>{});
+                    }
+                } catch(e) {}
+            }
         }
         res.redirect('/transactions');
     } catch (error) { res.redirect('/transactions'); }
@@ -431,17 +432,12 @@ router.post('/transaction/:id/global-cancel', async (req, res) => {
         const tx = await Transaction.findById(req.params.id);
         if (tx) {
             if (tx.status === 'completed' || tx.status === 'processing' || tx.status === 'accepted' || tx.status === 'pending') {
-                if (tx.clientBotId) await updateBalanceWithLedger('ClientBot', tx.clientBotId, tx.costLYD || 0, 'REFUND', tx.customId, 'حذف نهائي');
-                else if (tx.userId) {
-                    const user = await User.findOne({ telegramId: tx.userId });
-                    if (user) await updateBalanceWithLedger('User', user._id, tx.costLYD || 0, 'REFUND', tx.customId, 'حذف نهائي');
-                }
+                if (tx.clientBotId) await ClientBot.findByIdAndUpdate(tx.clientBotId, { $inc: { balance: tx.costLYD || 0 } });
+                else if (tx.userId) await User.findOneAndUpdate({ telegramId: tx.userId }, { $inc: { balance: tx.costLYD || 0 } });
             }
-            if (tx.status === 'completed' && tx.executorBotId) {
-                await updateBalanceWithLedger('ExecutorBot', tx.executorBotId, tx.amount, 'REFUND', tx.customId, 'حذف نهائي (إرجاع للعهدة)');
-            }
-            
+            const botId = tx.executorBotId; const managerBotId = tx.managerBotId;
             await Transaction.findByIdAndDelete(tx._id);
+            if(botId) await syncBotBalance(botId); if(managerBotId) await syncBotBalance(managerBotId); 
         }
         res.redirect('/transactions');
     } catch (e) { res.redirect('/transactions'); }
@@ -455,187 +451,19 @@ router.post('/transaction/:id/change-bot', async (req, res) => {
         if (!tx || tx.status !== 'completed') return res.redirect('/transactions');
         if (tx.executorBotId && tx.executorBotId.toString() === newBotId.toString()) return res.redirect('/transactions');
 
-        if (tx.executorBotId) { 
-            await updateBalanceWithLedger('ExecutorBot', tx.executorBotId, tx.amount, 'REFUND', tx.customId, 'نقل محاسبي לבوت آخر');
-        }
-        
+        if (tx.executorBotId) { const oldBot = await ExecutorBot.findById(tx.executorBotId); if (oldBot) { oldBot.balance += tx.amount; await oldBot.save(); } }
+        if (tx.managerBotId) { const oldManager = await ExecutorBot.findById(tx.managerBotId); if (oldManager) { oldManager.balance += tx.amount; await oldManager.save(); } }
+
         const newBot = await ExecutorBot.findById(newBotId); let newManagerId = null;
         if (newBot) {
-            await updateBalanceWithLedger('ExecutorBot', newBot._id, -tx.amount, 'TRANSFER', tx.customId, 'نقل محاسبي من بوت آخر');
-            newManagerId = newBot.parentBotId || null;
+            newBot.balance -= tx.amount; await newBot.save();
+            if (newBot.parentBotId) { const newManager = await ExecutorBot.findById(newBot.parentBotId); if (newManager) { newManager.balance -= tx.amount; await newManager.save(); newManagerId = newManager._id; } }
         }
 
         tx.executorBotId = newBotId; tx.managerBotId = newManagerId; tx.executorBotName = newBot ? newBot.name : 'غير محدد';
         tx.notes = (tx.notes ? tx.notes + '\n' : '') + `[تم النقل محاسبياً إلى بوت: ${newBot ? newBot.name : 'غير معروف'}]`;
         await tx.save(); res.redirect('/transactions');
     } catch (error) { res.redirect('/transactions'); }
-});
-
-router.get('/executors', async (req, res) => {
-    try {
-        const bots = await ExecutorBot.find({}).sort({ createdAt: -1 });
-        const botsWithStats = await Promise.all(bots.map(async (bot) => {
-            let txCount = 0; 
-            if (bot.isManagerBot) txCount = await Transaction.countDocuments({ managerBotId: bot._id, status: 'completed' }); 
-            else txCount = await Transaction.countDocuments({ executorBotId: bot._id, status: 'completed' });
-            return { ...bot._doc, balance: bot.balance, txCount };
-        }));
-        res.render('executors', { bots: botsWithStats, adminName: req.session.adminName });
-    } catch (e) { res.redirect('/'); }
-});
-
-router.get('/executor/:id', async (req, res) => {
-    try {
-        const bot = await ExecutorBot.findById(req.params.id).populate('parentBotId');
-        let queryFilter = bot.isManagerBot ? { managerBotId: bot._id } : { executorBotId: bot._id };
-        const transactions = await Transaction.find(queryFilter).sort({ updatedAt: -1 }).limit(100);
-        
-        const managerBots = await ExecutorBot.find({ isManagerBot: true, status: 'active', _id: { $ne: bot._id } });
-
-        if (bot.isApiBot) {
-            const stats = {
-                successCount: transactions.filter(t => t.status === 'completed').length,
-                failedCount: transactions.filter(t => t.status === 'pending' && t.notes && t.notes.includes('فشل')).length,
-            };
-            return res.render('api_room', { bot, transactions, stats, managerBots, adminName: req.session.adminName });
-        }
-
-        res.render('executor_details', { bot, transactions, managerBots, adminName: req.session.adminName });
-    } catch (e) { res.redirect('/executors'); }
-});
-
-router.post('/executor/:id/settle', async (req, res) => {
-    try {
-        const bot = await ExecutorBot.findById(req.params.id); const amount = parseFloat(req.body.amount); const notes = req.body.notes ? req.body.notes.trim() : ''; 
-        let targetBotId = bot._id; let targetBotName = bot.name; let targetToken = bot.token;
-
-        if (!bot.isManagerBot && bot.parentBotId) { targetBotId = bot.parentBotId; const parentBot = await ExecutorBot.findById(targetBotId); if (parentBot) { targetBotName = parentBot.name; targetToken = parentBot.token; } }
-        
-        if (!isNaN(amount) && amount !== 0) {
-            const txId = `SETTLE-${Date.now().toString().slice(-6)}`;
-            
-            await updateBalanceWithLedger('ExecutorBot', targetBotId, amount, amount > 0 ? 'DEPOSIT' : 'DEDUCTION', txId, notes || 'تسوية نقدية');
-
-            const tx = await Transaction.create({
-                userId: 'admin', executorBotId: targetBotId, amount: Math.abs(amount), costLYD: 0, vodafoneNumber: 'تسديد حساب',
-                status: amount > 0 ? 'deposit' : 'deduction', customId: txId, companyName: 'الإدارة المركزية', employeeName: amount > 0 ? 'تسديد نقدية (إيداع)' : 'خصم من المنفذ', executorName: targetBotName, notes: notes 
-            });
-
-            if (!bot.isApiBot) {
-                const execAPI = new Telegram(targetToken); const emps = await Employee.find({ botId: targetBotId, status: 'active' });
-                const actionType = amount > 0 ? 'إيداع نقدية/تسديد' : 'خصم من الرصيد'; const msgText = `💰 <b>إشعار مالي من الإدارة (${actionType})</b>\n\n💵 المبلغ: <b>${Math.abs(amount).toFixed(2)} EGP</b>\n📝 الملاحظة: ${notes || 'لا يوجد'}\n🧾 الطلب: <code>${tx.customId}</code>`;
-                for(const e of emps) execAPI.sendMessage(e.telegramId, msgText, { parse_mode: 'HTML' }).catch(()=>{});
-                await Transaction.updateOne({ _id: tx._id }, { $set: { executorWebAlert: { type: amount > 0 ? 'success' : 'error', text: msgText.replace(/\n/g, '<br>') } } }, { strict: false });
-            }
-        }
-        res.redirect(`/executor/${bot._id}`);
-    } catch (e) { res.redirect('/executors'); }
-});
-
-router.post('/executor/:id/link-manager', async (req, res) => {
-    try {
-        const botId = req.params.id; const parentId = req.body.parentBotId; const bot = await ExecutorBot.findById(botId);
-        if (bot) { if (parentId === 'none') { bot.parentBotId = null; } else { bot.parentBotId = parentId; } await bot.save(); }
-        res.redirect(`/executor/${botId}`);
-    } catch (e) { res.redirect('/executors'); }
-});
-
-router.post('/executor/:id/toggle-status', async (req, res) => {
-    try {
-        const botId = req.params.id; const bot = await ExecutorBot.findById(botId); if (!bot) return res.redirect('/executors');
-        bot.status = bot.status === 'active' ? 'paused' : 'active'; await bot.save();
-        
-        if (!bot.isApiBot) {
-            try {
-                const botEmployees = await Employee.find({ botId: bot._id, telegramId: { $exists: true, $ne: null } });
-                if (botEmployees.length > 0 && bot.token) {
-                    const botAPI = new Telegram(bot.token);
-                    let message = bot.status === 'paused' ? `🔴 <b>إشعار إداري هام:</b>\n\nتم <b>إيقاف</b> هذا البوت مؤقتاً من قبل الإدارة المركزية.\nلا يمكنك استقبال أو تنفيذ أي عمليات حالياً حتى يتم تفعيله مجدداً.` : `🟢 <b>إشعار إداري:</b>\n\nتم <b>إعادة تشغيل وتفعيل</b> البوت بنجاح.\nيمكنك الآن استئناف عملك واستقبال الطلبات.`;
-                    for (const emp of botEmployees) await botAPI.sendMessage(emp.telegramId, message, { parse_mode: 'HTML' }).catch(()=>{});
-                }
-            } catch (tgError) {}
-        }
-        res.redirect(`/executor/${bot._id}`);
-    } catch (e) { res.redirect('/executors'); }
-});
-
-router.get('/clients', async (req, res) => {
-    const users = await User.find({}).sort({ createdAt: -1 }); const companies = await ClientBot.find({}).sort({ createdAt: -1 });
-    res.render('clients', { users, companies });
-});
-
-router.get('/user/:id', async (req, res) => {
-    const user = await User.findById(req.params.id); const transactions = await Transaction.find({ userId: user.telegramId, clientBotId: null }).sort({ createdAt: -1 }).limit(50);
-    res.render('user_details', { user, transactions });
-});
-
-router.get('/company/:id', async (req, res) => {
-    const company = await ClientBot.findById(req.params.id); const transactions = await Transaction.find({ clientBotId: company._id }).sort({ createdAt: -1 }).limit(50);
-    res.render('company_details', { company, transactions });
-});
-
-router.post('/user/:id/add-balance', async (req, res) => {
-    try {
-        const user = await User.findById(req.params.id); const amount = parseFloat(req.body.amount); const notes = req.body.notes ? req.body.notes.trim() : ''; 
-        if (!isNaN(amount) && amount !== 0) {
-            const txId = `DEP-${Date.now().toString().slice(-6)}`;
-            
-            await updateBalanceWithLedger('User', user._id, amount, amount > 0 ? 'DEPOSIT' : 'DEDUCTION', txId, notes || 'تسوية نقدية');
-
-            const tx = await Transaction.create({ userId: user.telegramId, amount: Math.abs(amount), costLYD: 0, vodafoneNumber: '01000000000', status: amount > 0 ? 'deposit' : 'deduction', customId: txId, companyName: 'عميل فردي', employeeName: amount > 0 ? 'الإدارة (إيداع)' : 'الإدارة (خصم)', notes: notes });
-            const actionType = amount > 0 ? 'إيداع/شحن رصيد' : 'خصم من الرصيد'; const msg = `💰 <b>إشعار مالي من الإدارة (${actionType})</b>\n\n💵 المبلغ: <b>${Math.abs(amount).toFixed(2)} دينار/EGP</b>\n📝 الملاحظة: ${notes || 'لا يوجد'}\n🧾 رقم العملية: <code>${tx.customId}</code>`;
-            const mainAPI = new Telegram(process.env.CLIENT_BOT_TOKEN); mainAPI.sendMessage(user.telegramId, msg, { parse_mode: 'HTML' }).catch(()=>{});
-        }
-        res.redirect(`/user/${user._id}`);
-    } catch (e) { res.redirect('/'); }
-});
-
-router.post('/user/:id/toggle-status', async (req, res) => {
-    const user = await User.findById(req.params.id); user.status = user.status === 'active' ? 'banned' : 'active'; await user.save(); res.redirect(`/user/${user._id}`);
-});
-
-router.post('/user/:id/change-level', async (req, res) => {
-    await User.findByIdAndUpdate(req.params.id, { tier: parseInt(req.body.tier) }); res.redirect(`/user/${req.params.id}`);
-});
-
-router.post('/user/:id/update-limit', async (req, res) => {
-    try { const limit = Math.abs(parseFloat(req.body.creditLimit) || 0); await User.findByIdAndUpdate(req.params.id, { creditLimit: limit }); res.redirect(`/user/${req.params.id}`); } catch (e) { res.redirect('/clients'); }
-});
-
-router.post('/company/:id/add-balance', async (req, res) => {
-    try {
-        const comp = await ClientBot.findById(req.params.id); const amount = parseFloat(req.body.amount); const notes = req.body.notes ? req.body.notes.trim() : '';
-        if (!isNaN(amount) && amount !== 0) {
-            const txId = `DEP-${Date.now().toString().slice(-6)}`;
-            
-            await updateBalanceWithLedger('ClientBot', comp._id, amount, amount > 0 ? 'DEPOSIT' : 'DEDUCTION', txId, notes || 'تسوية نقدية');
-
-            const tx = await Transaction.create({ userId: 'admin', clientBotId: comp._id, amount: Math.abs(amount), costLYD: 0, vodafoneNumber: '01000000000', status: amount > 0 ? 'deposit' : 'deduction', customId: txId, companyName: comp.name, employeeName: amount > 0 ? 'الإدارة (إيداع)' : 'الإدارة (خصم)', notes: notes });
-            const actionType = amount > 0 ? 'إيداع/شحن رصيد' : 'خصم من الرصيد'; const msg = `💰 <b>إشعار مالي من الإدارة (${actionType})</b>\n\n💵 المبلغ: <b>${Math.abs(amount).toFixed(2)} دينار/EGP</b>\n📝 الملاحظة: ${notes || 'لا يوجد'}\n🧾 رقم العملية: <code>${tx.customId}</code>`;
-            const compAPI = new Telegram(comp.token); const emps = await ClientEmployee.find({ clientBotId: comp._id, status: 'active' }); for(const emp of emps) compAPI.sendMessage(emp.telegramId, msg, { parse_mode: 'HTML' }).catch(()=>{});
-        }
-        res.redirect(`/company/${comp._id}`);
-    } catch (e) { res.redirect('/'); }
-});
-
-router.post('/company/:id/update-rate', async (req, res) => {
-    try { 
-        const rate = Math.abs(parseFloat(req.body.exchangeRate) || 0); 
-        await ClientBot.findByIdAndUpdate(req.params.id, { exchangeRate: rate }, { strict: false }); 
-        res.redirect(`/company/${req.params.id}`); 
-    } catch (e) { res.redirect('/clients'); }
-});
-
-router.post('/company/:id/toggle-status', async (req, res) => {
-    const comp = await ClientBot.findById(req.params.id); comp.status = comp.status === 'active' ? 'inactive' : 'active'; await comp.save(); res.redirect(`/company/${comp._id}`);
-});
-
-router.post('/company/:id/change-level', async (req, res) => {
-    await ClientBot.findByIdAndUpdate(req.params.id, { tier: parseInt(req.body.tier) }); res.redirect(`/company/${req.params.id}`);
-});
-
-router.post('/company/:id/update-limit', async (req, res) => {
-    try { const limit = Math.abs(parseFloat(req.body.creditLimit) || 0); await ClientBot.findByIdAndUpdate(req.params.id, { creditLimit: limit }); res.redirect(`/company/${req.params.id}`); } catch (e) { res.redirect('/clients'); }
 });
 
 module.exports = router;
