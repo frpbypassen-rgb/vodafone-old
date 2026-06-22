@@ -1339,6 +1339,10 @@ app.get('/api/v1/merchant/status/:reference_id', merchantApiAuth, async (req, re
     }
 });
 
+// Integration API must be mounted after the existing /api routes so its
+// x-api-key middleware does not intercept the dashboard or merchant APIs.
+app.use('/api', require('./routes/api/clientApi'));
+
 app.use(notFoundHandler);
 app.use(errorHandler);
 
